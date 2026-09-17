@@ -1,89 +1,66 @@
 # Optima
 
-Application de bureau (Linux/GNOME, Python + Tkinter) pour transformer ta
-carte Wi-Fi en point d'accès et partager ta connexion internet avec d'autres
-appareils — utile quand ton réseau est derrière un portail captif et que tu
-n'as pas d'équivalent Linux à des outils comme Connectify.
+Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card into an access point and shares your internet connection with other devices — useful when your network is behind a captive portal and you don't have a Linux equivalent to tools like Connectify.
 
-## Fonctionnalités
+## Features
 
-- Point d'accès Wi-Fi (`hostapd` + `dnsmasq` + NAT `iptables`) piloté depuis
-  une interface graphique simple
-- Normalisation TTL sur le trafic partagé
-- QR code de connexion, génération de mot de passe, copier/coller rapide
-- Icône dans la zone de notification, notifications système, historique des
-  appareils connectés
-- Limite du nombre d'appareils et du débit partagé
-- Démarrage automatique à l'ouverture de session
-- Système de licence **optionnel** (voir plus bas), désactivé par défaut
+- Wi-Fi access point (hostapd + dnsmasq + iptables NAT) controlled from a simple graphical interface
+- TTL normalization on shared traffic
+- Connection QR code, password generation, quick copy/paste
+- Tray icon, system notifications, connected devices history
+- Device count and shared bandwidth limits
+- Automatic startup on login
+- Optional licensing system (see below), disabled by default
 
-## Pré-requis
+## Requirements
 
-- Ubuntu/Debian avec GNOME (testé sur Ubuntu récent, Wayland)
-- Une carte Wi-Fi dont le pilote supporte la création d'une interface
-  virtuelle en mode AP (`iw list` → vérifier le mode `AP` dans les
-  combinaisons supportées)
-- `python3` + `python3-tk`
-- `hostapd`, `dnsmasq`, `policykit-1` (pour `pkexec`), `iw`, `iptables`,
-  `network-manager`
+- Ubuntu/Debian with GNOME (tested on recent Ubuntu, Wayland)
+- A Wi-Fi card whose driver supports creating a virtual interface in AP mode (`iw list` → check for AP mode in the supported combinations)
+- python3 + python3-tk
+- hostapd, dnsmasq, policykit-1 (for pkexec), iw, iptables, network-manager
 
-Optionnel (fonctionnalités qui se désactivent proprement si absentes) :
-- `pillow` (icônes, QR code) — souvent déjà présent sur Ubuntu
-- `qrcode` (`pip install --user qrcode`) pour le QR code de connexion
-- `pystray` (`pip install --user pystray`) pour l'icône de zone de
-  notification (nécessite `gir1.2-ayatanaappindicator3-0.1` sous Ubuntu/GNOME)
+Optional (features degrade gracefully if missing):
+
+- pillow (icons, QR code) — often already present on Ubuntu
+- qrcode (`pip install --user qrcode`) for the connection QR code
+- pystray (`pip install --user pystray`) for the tray icon (requires `gir1.2-ayatanaappindicator3-0.1` on Ubuntu/GNOME)
 
 ## Installation
 
 ```bash
-git clone <url-de-ce-depot>
+git clone <url-of-this-repo>
 cd optima
 ./install.sh
 ```
 
-Le script installe les dépendances système manquantes (`apt`, mot de passe
-demandé), copie l'application dans `~/.local/share/optima`, crée un lanceur
-(`optima`) et une entrée dans le menu des applications.
+The script installs any missing system dependencies (apt, will prompt for your password), copies the application to `~/.local/share/optima`, and creates a launcher (`optima`) and an entry in the applications menu.
 
-## Comment ça marche
+## How it works
 
-Optima crée une interface virtuelle `ap0` à côté de ta carte Wi-Fi
-principale (le pilote de la plupart des cartes ne supporte pas le mode
-simultané client + point d'accès sur une seule interface). `hostapd` gère le
-point d'accès sur `ap0`, `dnsmasq` distribue les IP, et des règles
-`iptables` font le NAT vers ta connexion principale.
+Optima creates a virtual `ap0` interface alongside your main Wi-Fi card (most card drivers don't support simultaneous client + access point mode on a single interface). hostapd manages the access point on `ap0`, dnsmasq hands out IP addresses, and iptables rules perform NAT to your main connection.
 
-**Limite connue** : sur certaines cartes/pilotes, `hostapd` peut planter de
-façon reproductible après de nombreux cycles rapides de démarrage/arrêt
-(état du pilote dégradé). Un redémarrage de la machine résout le problème
-si ça arrive.
+Known limitation: on some cards/drivers, hostapd can crash reproducibly after many quick start/stop cycles (degraded driver state). Rebooting the machine resolves this if it happens.
 
-## Système de licence (optionnel)
+## Licensing system (optional)
 
-Par défaut, **aucune restriction** : l'application est entièrement
-utilisable dès l'installation. Si tu veux distribuer un binaire compilé à
-des tiers en exigeant une clé d'activation que toi seul peux générer :
+By default, there are no restrictions: the application is fully usable right after installation. If you want to distribute a compiled binary to third parties while requiring an activation key that only you can generate:
 
 ```bash
-# 1. Genere un secret que tu gardes prive (ne le commite jamais)
+# 1. Generate a secret that you keep private (never commit it)
 python3 -c "import secrets; print(secrets.token_hex(32))"
 
-# 2. Exporte-le avant de lancer/compiler l'application
-export OPTIMA_LICENSE_SECRET=<le_secret>
+# 2. Export it before running/building the application
+export OPTIMA_LICENSE_SECRET=<the_secret>
 
-# 3. Cree ce fichier sur ta propre machine pour debloquer le panneau admin
-#    (generation de cles) dans Parametres :
+# 3. Create this file on your own machine to unlock the admin panel
+#    (key generation) in Settings:
 mkdir -p ~/.config/optima && touch ~/.config/optima/.admin
 ```
 
-Sans `OPTIMA_LICENSE_SECRET`, ce mécanisme est entièrement désactivé (pas
-d'écran d'activation, pas de panneau admin). C'est volontaire : ce dépôt
-public ne contient aucun secret intégré.
+Without `OPTIMA_LICENSE_SECRET`, this mechanism is entirely disabled (no activation screen, no admin panel). This is intentional: this public repository does not contain any embedded secret.
 
-À savoir : c'est du Python en clair, pas un système anti-piratage robuste —
-ça filtre une copie occasionnelle, pas une personne qui lit le code source.
+Note: this is plain Python, not a robust anti-piracy system — it filters out occasional copying, not someone who reads the source code.
 
-## Licence de ce dépôt
+## License
 
-Aucune licence choisie pour l'instant. Ajoute un fichier `LICENSE` (par
-exemple MIT) si tu veux clarifier les conditions de réutilisation du code.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
