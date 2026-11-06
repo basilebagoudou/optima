@@ -4,10 +4,15 @@ Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card i
 
 ## Features
 
-- Wi-Fi access point (hostapd + dnsmasq + iptables NAT) controlled from a simple graphical interface
+- Wi-Fi access point (hostapd + dnsmasq + iptables NAT) started and stopped with one big power button
 - TTL normalization on shared traffic
-- Connection QR code, password generation, quick copy/paste
-- Tray icon, system notifications, connected devices history
+- Live dashboard: shared-session uptime, live download/upload speed with a 60-second graph, data used this session
+- Per-device management: signal strength, connection time, data used, custom nicknames,
+  cut a device's internet access without disconnecting it, disconnect and block a device, unblock it later
+- Connection QR code shown right in the window, password generation, quick copy
+- Scheduled automatic stop (15 min to 4 h)
+- Light and dark themes (follows the GNOME setting, or forced in Settings), rounded macOS-like design, HiDPI aware
+- Tray icon, system notifications (can be turned off), connection history grouped by day
 - Device count and shared bandwidth limits
 - Automatic startup on login
 - Optional licensing system (see below), disabled by default
@@ -22,8 +27,15 @@ Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card i
 Optional (features degrade gracefully if missing):
 
 - pillow (icons, QR code) — often already present on Ubuntu
-- qrcode (`pip install --user qrcode`) for the connection QR code
-- pystray (`pip install --user pystray`) for the tray icon (requires `gir1.2-ayatanaappindicator3-0.1` on Ubuntu/GNOME)
+- qrcode (`sudo apt install python3-qrcode`) for the connection QR code
+- pystray (`sudo apt install python3-pystray`) for the tray icon (requires `gir1.2-ayatanaappindicator3-0.1` on Ubuntu/GNOME)
+
+`install.sh` installs these optional modules automatically.
+
+Per-device statistics (signal, data used, connection time) are read from hostapd's control socket,
+which Optima makes readable by your user group when it starts the access point — no root needed
+for the live dashboard. Actions that change the network (start, stop, cut, block) ask for your
+password through pkexec.
 
 ## Installation
 

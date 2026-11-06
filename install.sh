@@ -31,6 +31,13 @@ python3 -c "import tkinter" 2>/dev/null || {
     sudo apt-get install -y python3-tk
 }
 
+# Modules optionnels : QR code de connexion et icone dans la barre du haut.
+python3 -c "import qrcode, pystray" 2>/dev/null || {
+    echo "Installation des modules optionnels (QR code, icone de la barre)..."
+    sudo apt-get install -y python3-qrcode python3-pystray gir1.2-ayatanaappindicator3-0.1 || \
+        echo "Modules optionnels non installes : l'application fonctionne sans."
+}
+
 # 2. Copie des fichiers de l'application.
 echo "Copie des fichiers dans $DEST ..."
 mkdir -p "$DEST"
