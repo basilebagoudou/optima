@@ -51,6 +51,10 @@ The script installs any missing system dependencies (apt, will prompt for your p
 
 Optima creates a virtual `ap0` interface alongside your main Wi-Fi card (most card drivers don't support simultaneous client + access point mode on a single interface). hostapd manages the access point on `ap0`, dnsmasq hands out IP addresses, and iptables rules perform NAT to your main connection.
 
+Because the card has a single radio, the access point always uses the same channel as your Wi-Fi connection: 2.4 GHz networks and 5 GHz channels 36–48 work. On radar (DFS) channels the card is not allowed to start an access point, and Optima tells you so and suggests switching to a 2.4 GHz network.
+
+`install.sh` also installs a small system part (`systeme/`, root): a NetworkManager rule that leaves `ap0` alone (otherwise NetworkManager can grab it at startup and crash Wi-Fi until reboot), and polkit actions so the password prompt shows a clear sentence instead of the raw command.
+
 Known limitation: on some cards/drivers, hostapd can crash reproducibly after many quick start/stop cycles (degraded driver state). Rebooting the machine resolves this if it happens.
 
 ## Licensing system (optional)

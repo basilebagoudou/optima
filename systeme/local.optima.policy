@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Optima</vendor>
+  <action id="local.optima.start">
+    <description>Optima : start</description>
+    <message>Optima a besoin de ton mot de passe pour démarrer le point d’accès Wi-Fi et partager ta connexion Internet.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/start</annotate>
+  </action>
+  <action id="local.optima.stop">
+    <description>Optima : stop</description>
+    <message>Optima a besoin de ton mot de passe pour arrêter le point d’accès Wi-Fi.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/stop</annotate>
+  </action>
+  <action id="local.optima.cut">
+    <description>Optima : cut</description>
+    <message>Optima a besoin de ton mot de passe pour couper Internet à un appareil connecté.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/cut</annotate>
+  </action>
+  <action id="local.optima.restore">
+    <description>Optima : restore</description>
+    <message>Optima a besoin de ton mot de passe pour rétablir Internet sur un appareil connecté.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/restore</annotate>
+  </action>
+  <action id="local.optima.kick">
+    <description>Optima : kick</description>
+    <message>Optima a besoin de ton mot de passe pour déconnecter et bloquer un appareil.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/kick</annotate>
+  </action>
+  <action id="local.optima.unblock">
+    <description>Optima : unblock</description>
+    <message>Optima a besoin de ton mot de passe pour débloquer un appareil.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/unblock</annotate>
+  </action>
+</policyconfig>

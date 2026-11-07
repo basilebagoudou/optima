@@ -71,6 +71,12 @@ EOF
 
 update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
 
+# 5. Partie systeme (root) : protection de l'interface ap0 contre NetworkManager
+#    et messages clairs dans la fenetre de mot de passe.
+echo "Installation de la partie systeme (mot de passe administrateur demande)..."
+sudo bash "$SCRIPT_DIR/systeme/installer-systeme.sh" "$DEST" || \
+    echo "Partie systeme non installee : Optima fonctionne, mais NetworkManager peut perturber le demarrage."
+
 echo ""
 echo "=== Installation terminee ==="
 echo "Lance Optima depuis le menu des applications, ou tape 'optima' dans un terminal."
