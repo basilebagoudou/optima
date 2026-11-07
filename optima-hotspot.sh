@@ -102,26 +102,45 @@ start_ap() {
     channel=$(detect_channel "$uplink")
     [ -z "$channel" ] && channel=1
 
-    # 07/11/2026 : la carte n'a qu'une radio, le point d'acces doit emettre sur le canal
-    # de la connexion Wi-Fi du PC. Canal > 14 = bande 5 GHz -> hw_mode=a (avec g, hostapd
-    # refuse un canal 5 GHz et ne demarre pas). Le 5 GHz est « IR-CONCURRENT » sur ce
-    # pilote : autorise seulement tant que le PC reste connecte sur ce meme canal.
+    # 07/11/2026 : la carte n'a qu'une radio, le point d'acces emet forcement sur le canal
+    # de la connexion Wi-Fi du PC. Sur ce PC (Intel, pays FR), tous les canaux 5 GHz sont
+    # « No IR » : la carte n'a pas le droit d'y creer un reseau, hostapd refuse
+    # (« Hardware does not support configured channel »). Dans ce cas, si le meme Wi-Fi
+    # existe aussi en 2,4 GHz (box bi-bande), Optima y bascule le PC puis demarre.
+    # Sinon, message clair. Le profil Wi-Fi garde ensuite la bande 2,4 GHz.
+    local phy_check reseau
+    phy_check=$(iw dev "$uplink" info | awk '/wiphy/{print "phy"$2; exit}')
+    reseau=$(iw dev "$uplink" info | sed -n 's/^[[:space:]]*ssid //p' | head -1)
+
+    canal_interdit() {
+        iw phy "$phy_check" channels 2>/dev/null | awk -v c="[$1]" '
+            $0 ~ /^[[:space:]]*\*/ { dedans = (index($0, c) > 0); if (dedans && $0 ~ /disabled/) print "disabled"; next }
+            dedans { print }' | grep -qiE 'no ir|radar|disabled'
+    }
+
+    if canal_interdit "$channel"; then
+        local profil existe_24 i
+        profil=$(nmcli -g GENERAL.CONNECTION device show "$uplink" 2>/dev/null)
+        existe_24=$(nmcli -t -f SSID,CHAN device wifi list ifname "$uplink" 2>/dev/null \
+            | awk -F: -v s="$reseau" '$1==s && $2+0>=1 && $2+0<=14 {print "oui"; exit}')
+        if [ -n "$profil" ] && [ "$existe_24" = "oui" ]; then
+            echo "Le Wi-Fi « $reseau » est en 5 GHz (canal $channel) : bascule sur sa bande 2,4 GHz..."
+            nmcli connection modify "$profil" 802-11-wireless.band bg
+            nmcli connection up "$profil" ifname "$uplink" >/dev/null 2>&1 || true
+            for i in $(seq 1 25); do
+                channel=$(detect_channel "$uplink")
+                [ -n "$channel" ] && [ "$channel" -le 14 ] 2>/dev/null && break
+                sleep 1
+            done
+        fi
+        if [ -z "$channel" ] || canal_interdit "$channel"; then
+            echo "MESSAGE: Optima ne peut pas partager « ${reseau:-ce Wi-Fi} » : ce réseau émet en 5 GHz (canal ${channel:-?}), et la carte Wi-Fi de ce PC n'a pas le droit d'y créer un point d'accès. Connecte le PC à un Wi-Fi en 2,4 GHz, puis relance le partage." >&2
+            exit 2
+        fi
+    fi
+
     local hw_mode=g
     [ "$channel" -gt 14 ] 2>/dev/null && hw_mode=a
-
-    # 07/11/2026 : verifier AVANT de lancer hostapd que la carte a le droit d'emettre
-    # un point d'acces sur ce canal, et sinon expliquer pourquoi (au lieu d'un echec muet).
-    # Canaux « Radar detection » (5 GHz, 52 a 144 en France) ou desactives : interdits.
-    local phy_check flags reseau
-    phy_check=$(iw dev "$uplink" info | awk '/wiphy/{print "phy"$2; exit}')
-    flags=$(iw phy "$phy_check" channels 2>/dev/null | awk -v c="[$channel]" '
-        $0 ~ /^[[:space:]]*\*/ { dedans = (index($0, c) > 0); if (dedans && $0 ~ /disabled/) print "disabled"; next }
-        dedans { print }')
-    reseau=$(iw dev "$uplink" info | sed -n 's/^[[:space:]]*ssid //p' | head -1)
-    if printf '%s' "$flags" | grep -qiE 'radar|disabled'; then
-        echo "MESSAGE: Optima ne peut pas partager « ${reseau:-ce Wi-Fi} » : il emet sur le canal $channel (5 GHz), un canal reserve aux radars ou la carte Wi-Fi n'a pas le droit de creer un point d'acces. Connecte le PC a un Wi-Fi en 2,4 GHz (ou en 5 GHz sur les canaux 36 a 48), puis relance le partage." >&2
-        exit 2
-    fi
 
     stop_all
     sleep 2
