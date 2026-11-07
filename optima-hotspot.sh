@@ -51,6 +51,8 @@ stop_all() {
         iptables -t mangle -D POSTROUTING -o "$uplink" -j TTL --ttl-set 65 2>/dev/null || true
         iptables -t mangle -D PREROUTING -i "$uplink" -j TTL --ttl-set 65 2>/dev/null || true
     fi
+    # Regle d'isolement (independante du lien montant), retiree dans tous les cas.
+    while iptables -D FORWARD -i "$AP_IFACE" -o "$AP_IFACE" -j DROP 2>/dev/null; do :; done
     # Chaines dediees a la coupure d'acces et au comptage de consommation
     # par appareil (donnees perdues volontairement a chaque arret : la
     # consommation affichee couvre la session de partage en cours).
@@ -65,6 +67,19 @@ start_ap() {
     local password="$2"
     local max_clients="${3:-20}"
     local bandwidth_mbps="${4:-0}"
+    # 06/11/2026 : reglages supplementaires (reseau masque, isolement, DNS)
+    local hidden="${5:-0}"
+    local isolate="${6:-0}"
+    local dns="${7:-auto}"
+    [ "$hidden" = 1 ] || hidden=0
+    [ "$isolate" = 1 ] || isolate=0
+    local dns_clients
+    case "$dns" in
+        cloudflare) dns_clients="1.1.1.1,1.0.0.1" ;;
+        google) dns_clients="8.8.8.8,8.8.4.4" ;;
+        quad9) dns_clients="9.9.9.9,149.112.112.112" ;;
+        *) dns_clients="10.42.0.1,8.8.8.8" ;;
+    esac
 
     case "$max_clients" in ''|*[!0-9]*) max_clients=20 ;; esac
     case "$bandwidth_mbps" in ''|*[!0-9]*) bandwidth_mbps=0 ;; esac
@@ -87,6 +102,27 @@ start_ap() {
     channel=$(detect_channel "$uplink")
     [ -z "$channel" ] && channel=1
 
+    # 07/11/2026 : la carte n'a qu'une radio, le point d'acces doit emettre sur le canal
+    # de la connexion Wi-Fi du PC. Canal > 14 = bande 5 GHz -> hw_mode=a (avec g, hostapd
+    # refuse un canal 5 GHz et ne demarre pas). Le 5 GHz est « IR-CONCURRENT » sur ce
+    # pilote : autorise seulement tant que le PC reste connecte sur ce meme canal.
+    local hw_mode=g
+    [ "$channel" -gt 14 ] 2>/dev/null && hw_mode=a
+
+    # 07/11/2026 : verifier AVANT de lancer hostapd que la carte a le droit d'emettre
+    # un point d'acces sur ce canal, et sinon expliquer pourquoi (au lieu d'un echec muet).
+    # Canaux « Radar detection » (5 GHz, 52 a 144 en France) ou desactives : interdits.
+    local phy_check flags reseau
+    phy_check=$(iw dev "$uplink" info | awk '/wiphy/{print "phy"$2; exit}')
+    flags=$(iw phy "$phy_check" channels 2>/dev/null | awk -v c="[$channel]" '
+        $0 ~ /^[[:space:]]*\*/ { dedans = (index($0, c) > 0); if (dedans && $0 ~ /disabled/) print "disabled"; next }
+        dedans { print }')
+    reseau=$(iw dev "$uplink" info | sed -n 's/^[[:space:]]*ssid //p' | head -1)
+    if printf '%s' "$flags" | grep -qiE 'radar|disabled'; then
+        echo "MESSAGE: Optima ne peut pas partager « ${reseau:-ce Wi-Fi} » : il emet sur le canal $channel (5 GHz), un canal reserve aux radars ou la carte Wi-Fi n'a pas le droit de creer un point d'acces. Connecte le PC a un Wi-Fi en 2,4 GHz (ou en 5 GHz sur les canaux 36 a 48), puis relance le partage." >&2
+        exit 2
+    fi
+
     stop_all
     sleep 2
 
@@ -106,7 +142,7 @@ start_ap() {
 interface=$AP_IFACE
 driver=nl80211
 ssid=$ssid
-hw_mode=g
+hw_mode=$hw_mode
 channel=$channel
 wpa=2
 wpa_passphrase=$password
@@ -117,6 +153,8 @@ ctrl_interface=$RUN_DIR/hostapd_ctrl
 ctrl_interface_group=$ctrl_group
 macaddr_acl=0
 deny_mac_file=$RUN_DIR/denylist
+ignore_broadcast_ssid=$hidden
+ap_isolate=$isolate
 EOF
 
     local phy essai hostapd_ok=false
@@ -168,7 +206,7 @@ bind-interfaces
 except-interface=lo
 dhcp-range=10.42.0.10,10.42.0.$dhcp_fin,255.255.255.0,12h
 dhcp-option=3,10.42.0.1
-dhcp-option=6,10.42.0.1,8.8.8.8
+dhcp-option=6,$dns_clients
 dhcp-leasefile=$RUN_DIR/dnsmasq.leases
 EOF
 
@@ -194,6 +232,10 @@ EOF
     iptables -t nat -A POSTROUTING -o "$uplink" -j MASQUERADE
     iptables -A FORWARD -j OPTIMA_CUT
     iptables -A FORWARD -j OPTIMA_ACCT
+    # Isolement : les appareils connectes ne se voient pas entre eux.
+    if [ "$isolate" = 1 ]; then
+        iptables -A FORWARD -i "$AP_IFACE" -o "$AP_IFACE" -j DROP
+    fi
     iptables -A FORWARD -i "$AP_IFACE" -o "$uplink" -j ACCEPT
     iptables -A FORWARD -i "$uplink" -o "$AP_IFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
 
@@ -436,7 +478,7 @@ status() {
 }
 
 case "$1" in
-    start) start_ap "$2" "$3" "$4" "$5" ;;
+    start) start_ap "$2" "$3" "$4" "$5" "$6" "$7" "$8" ;;
     stop) stop_all; echo "OK" ;;
     status) status ;;
     kick) kick_mac "$2" ;;

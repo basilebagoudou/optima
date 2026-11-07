@@ -114,6 +114,14 @@ CONFIG_PAR_DEFAUT = {
     "theme": "auto",          # auto | clair | sombre
     "notifier_appareils": True,
     "surnoms": {},            # mac -> nom choisi
+    # 06/11/2026 : reglages supplementaires
+    "partage_ouverture": False,   # demarrer le partage quand on ouvre Optima
+    "fermeture": "reduire",       # reduire | quitter (croix de la fenetre)
+    "reseau_masque": False,       # ne pas diffuser le nom du reseau
+    "isoler_appareils": False,    # les appareils ne se voient pas entre eux
+    "dns": "auto",                # auto | cloudflare | google | quad9
+    "arret_inactif_min": 0,       # arret si aucun appareil depuis N min (0 = jamais)
+    "confirmer_arret": True,      # demander avant d'arreter si des appareils sont connectes
 }
 
 ERREURS_CONNUES = {
@@ -135,6 +143,10 @@ ARRETS_PROGRAMMES = [0, 15, 30, 60, 120, 240]  # minutes, 0 = jamais
 
 
 def message_convivial(sortie):
+    # 07/11/2026 : le script peut fournir directement un message complet, a afficher tel quel.
+    for ligne in (sortie or "").splitlines():
+        if ligne.startswith("MESSAGE: "):
+            return ligne[len("MESSAGE: "):]
     bas = (sortie or "").lower()
     for cle, message in ERREURS_CONNUES.items():
         if cle in bas:
@@ -268,6 +280,19 @@ def echapper_wifi(valeur):
     return re.sub(r'([\\;,":])', r'\\\1', valeur)
 
 
+LANCEURS_ROOT = Path("/usr/local/libexec/optima")
+
+
+def commande_privilegiee(*args):
+    """Passe par un lanceur dedie (/usr/local/libexec/optima/<action>) declare
+    dans polkit : la fenetre de mot de passe affiche alors une phrase claire
+    au lieu de la commande (et du mot de passe Wi-Fi)."""
+    lanceur = LANCEURS_ROOT / args[0] if args else None
+    if lanceur and lanceur.is_file():
+        return ["pkexec", str(lanceur), *args[1:]]
+    return ["pkexec", "bash", str(HOTSPOT_SCRIPT), *args]
+
+
 def executer_privilegie(*args):
     """Lance le script hotspot en root via pkexec, renvoie (ok, sortie)."""
     env = os.environ.copy()
@@ -276,7 +301,7 @@ def executer_privilegie(*args):
     env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     try:
         resultat = subprocess.run(
-            ["pkexec", "bash", str(HOTSPOT_SCRIPT), *args],
+            commande_privilegiee(*args),
             capture_output=True, text=True, timeout=60, env=env,
         )
         sortie = (resultat.stdout + resultat.stderr).strip()
@@ -400,14 +425,24 @@ def barres_signal(dbm):
 
 
 def image_icone_tray(actif):
+    # Point rond : vert quand le partage est actif, gris quand il est arrete
+    # (dessine en 4x puis reduit pour des bords lisses).
     taille = 64
-    image = Image.new("RGBA", (taille, taille), (0, 0, 0, 0))
-    dessin = ImageDraw.Draw(image)
     couleur = (52, 199, 89, 255) if actif else (142, 142, 147, 255)
-    for i, r in enumerate((28, 19, 10)):
-        dessin.arc((32 - r, 40 - r, 32 + r, 40 + r), 220, 320, fill=couleur, width=6)
-    dessin.ellipse((27, 35, 37, 45), fill=couleur)
-    return image
+    grand = Image.new("RGBA", (taille * 4, taille * 4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(grand)
+    r = 19 * 4
+    c = taille * 2
+    d.ellipse((c - r, c - r, c + r, c + r), fill=couleur)
+    return grand.resize((taille, taille), Image.LANCZOS)
+
+
+def _curseur_systeme(racine):
+    """Tk (sans libXcursor) dessine ses curseurs nommes (main, barre en I...)
+    avec les vieux curseurs X au lieu du theme Bibata. Curseur vide = herite
+    de la fenetre racine -> on garde partout le curseur normal du systeme."""
+    racine.option_add("*cursor", "")
+    racine.configure(cursor="")
 
 
 def _premier_plan(win):
@@ -439,7 +474,7 @@ class Carte(tk.Canvas):
         self.t, self.rayon, self.marge = t, rayon, marge
         self.corps = tk.Frame(self, bg=t["carte"])
         if titre:
-            tk.Label(self.corps, text=titre, font=(POLICE, 10, "bold"), bg=t["carte"],
+            tk.Label(self.corps, text=titre, font=(POLICE, 12, "bold"), bg=t["carte"],
                      fg=t["texte_att"], anchor="w").pack(fill="x", pady=px((0, 6)))
         self._fenetre = self.create_window(marge, marge, window=self.corps, anchor="nw")
         self.bind("<Configure>", self._redessiner)
@@ -458,7 +493,7 @@ class Carte(tk.Canvas):
 
 
 class BoutonPilule(tk.Canvas):
-    def __init__(self, parent, t, texte, commande, style="secondaire", taille=10,
+    def __init__(self, parent, t, texte, commande, style="secondaire", taille=12,
                  hauteur=px(34), largeur=None, fond_parent=None):
         self.t = t
         self.texte, self.commande, self.style = texte, commande, style
@@ -468,7 +503,7 @@ class BoutonPilule(tk.Canvas):
         self.largeur_fixe = largeur
         l = largeur or self._largeur_texte(parent, texte)
         super().__init__(parent, width=l, height=hauteur, bg=bg, highlightthickness=0,
-                         bd=0, cursor="hand2")
+                         bd=0)
         self._survol = False
         self.bind("<Configure>", lambda _e: self._dessiner())
         self.bind("<Enter>", lambda _e: self._etat_survol(True))
@@ -515,7 +550,7 @@ class BoutonPilule(tk.Canvas):
                 self.config(width=self._largeur_texte(self, texte))
         if actif is not None:
             self.actif = actif
-            self.config(cursor="hand2" if actif else "arrow")
+            self.config(cursor="")
         if style is not None:
             self.style = style
         self._dessiner()
@@ -526,7 +561,7 @@ class Interrupteur(tk.Canvas):
 
     def __init__(self, parent, t, variable, fond_parent=None):
         super().__init__(parent, width=px(44), height=px(26), bg=fond_parent or t["carte"],
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0)
         self.t, self.variable = t, variable
         self.bind("<ButtonRelease-1>", lambda _e: (variable.set(not variable.get()), self._dessiner()))
         self._dessiner()
@@ -546,7 +581,7 @@ class BoutonMarche(tk.Canvas):
 
     def __init__(self, parent, t, commande):
         super().__init__(parent, width=self.TAILLE, height=self.TAILLE, bg=t["carte"],
-                         highlightthickness=0, bd=0, cursor="hand2")
+                         highlightthickness=0, bd=0)
         self.t, self.commande = t, commande
         self.etat = "arret"  # arret | marche | attente
         self._angle = 0
@@ -623,13 +658,14 @@ class Graphe(tk.Canvas):
 
 # -- application -----------------------------------------------------------------
 class OptimaApp(tk.Tk):
-    LARGEUR, HAUTEUR = px(480), px(860)
+    LARGEUR, HAUTEUR = px(540), px(900)
 
     def __init__(self, mode_auto=False):
         super().__init__(className="Optima")
+        _curseur_systeme(self)
         self.after(250, lambda: _premier_plan(self))
         self.title("Optima")
-        self.minsize(px(440), px(600))
+        self.minsize(px(480), px(600))
         try:
             self._image_icone = tk.PhotoImage(file=str(ICONE_APP))
             self.iconphoto(True, self._image_icone)
@@ -646,6 +682,7 @@ class OptimaApp(tk.Tk):
         self._compteurs_prec = None
         self._session_depart = None
         self.arret_programme = None   # timestamp
+        self._sans_appareil_depuis = None
         self.duree_arret = 0
         self._nom_source = None
         self._qr_visible = False
@@ -664,6 +701,11 @@ class OptimaApp(tk.Tk):
             if TRAY_DISPONIBLE:
                 self.withdraw()
             self.after(1000, self._demarrage_auto)
+        elif self.config_actuelle.get("partage_ouverture"):
+            def verifier():
+                if not lire_statut().get("running"):
+                    self._en_main(self._demarrage_auto)
+            self.after(1000, lambda: threading.Thread(target=verifier, daemon=True).start())
 
     def _en_main(self, fonction):
         self._file.put(fonction)
@@ -709,8 +751,8 @@ class OptimaApp(tk.Tk):
         self.contenu.bind("<Configure>", lambda _e: self.toile.configure(scrollregion=self.toile.bbox("all")))
         self.toile.bind("<Configure>", lambda e: self.toile.itemconfig(self._id_contenu, width=e.width))
         for seq, delta in (("<Button-4>", -2), ("<Button-5>", 2)):
-            self.bind_all(seq, lambda _e, d=delta: self._defiler(d))
-        self.bind_all("<MouseWheel>", lambda e: self._defiler(-1 if e.delta > 0 else 1))
+            self.bind_all(seq, lambda e, d=delta: self._defiler(d, e))
+        self.bind_all("<MouseWheel>", lambda e: self._defiler(-1 if e.delta > 0 else 1, e))
 
         c = self.contenu
         # en-tete
@@ -718,9 +760,9 @@ class OptimaApp(tk.Tk):
         tete.pack(fill="x", padx=px(20), pady=px((18, 10)))
         tk.Label(tete, text="Optima", font=(POLICE, 22, "bold"), bg=t["fond"],
                  fg=t["texte"]).pack(side="left")
-        BoutonPilule(tete, t, "Réglages", self._ouvrir_parametres, taille=9, hauteur=px(28),
+        BoutonPilule(tete, t, "Réglages", self._ouvrir_parametres, taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right")
-        BoutonPilule(tete, t, "Historique", self._ouvrir_historique, taille=9, hauteur=px(28),
+        BoutonPilule(tete, t, "Historique", self._ouvrir_historique, taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
 
         # -- carte etat
@@ -735,12 +777,12 @@ class OptimaApp(tk.Tk):
         self.label_etat = tk.Label(infos, text="Vérification…", font=(POLICE, 17, "bold"),
                                    bg=t["carte"], fg=t["texte"], anchor="w")
         self.label_etat.pack(fill="x", pady=px((10, 0)))
-        self.label_sous_etat = tk.Label(infos, text="", font=(POLICE, 10), bg=t["carte"],
+        self.label_sous_etat = tk.Label(infos, text="", font=(POLICE, 12), bg=t["carte"],
                                         fg=t["texte_att"], anchor="w", justify="left",
-                                        wraplength=px(300))
+                                        wraplength=px(350))
         self.label_sous_etat.pack(fill="x")
-        self.label_source = tk.Label(infos, text="", font=(POLICE, 9), bg=t["carte"],
-                                     fg=t["texte_att"], anchor="w", justify="left", wraplength=px(300))
+        self.label_source = tk.Label(infos, text="", font=(POLICE, 11), bg=t["carte"],
+                                     fg=t["texte_att"], anchor="w", justify="left", wraplength=px(350))
         self.label_source.pack(fill="x", pady=px((2, 0)))
 
         # statistiques
@@ -753,9 +795,9 @@ class OptimaApp(tk.Tk):
             stats.columnconfigure(i, weight=1, uniform="s")
             bloc = tk.Frame(stats, bg=t["carte"])
             bloc.grid(row=0, column=i, sticky="w")
-            tk.Label(bloc, text=titre, font=(POLICE, 8), bg=t["carte"], fg=t["texte_att"],
+            tk.Label(bloc, text=titre, font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"],
                      anchor="w").pack(fill="x")
-            v = tk.Label(bloc, text="—", font=(POLICE, 10, "bold"), bg=t["carte"],
+            v = tk.Label(bloc, text="—", font=(POLICE, 12, "bold"), bg=t["carte"],
                          fg=t["texte"], anchor="w", justify="left")
             v.pack(fill="x")
             self.stat_vals[cle] = v
@@ -768,16 +810,16 @@ class OptimaApp(tk.Tk):
             p = tk.Canvas(legende, width=px(10), height=px(10), bg=t["carte"], highlightthickness=0)
             p.create_oval(px(1), px(1), px(9), px(9), fill=couleur, outline="")
             p.pack(side="left", padx=px((0, 4)))
-            tk.Label(legende, text=texte, font=(POLICE, 8), bg=t["carte"],
+            tk.Label(legende, text=texte, font=(POLICE, 10), bg=t["carte"],
                      fg=t["texte_att"]).pack(side="left", padx=px((0, 12)))
 
         # arret programme
         ligne_arret = tk.Frame(carte.corps, bg=t["carte"])
         ligne_arret.pack(fill="x", pady=px((12, 0)))
-        tk.Label(ligne_arret, text="Arrêt automatique", font=(POLICE, 10), bg=t["carte"],
+        tk.Label(ligne_arret, text="Arrêt automatique", font=(POLICE, 12), bg=t["carte"],
                  fg=t["texte"]).pack(side="left")
         self.bouton_arret_prog = BoutonPilule(ligne_arret, t, "Jamais", self._cycle_arret,
-                                              taille=9, hauteur=px(28), largeur=px(130))
+                                              taille=11, hauteur=px(28), largeur=px(130))
         self.bouton_arret_prog.pack(side="right")
 
         # -- carte reseau
@@ -787,22 +829,22 @@ class OptimaApp(tk.Tk):
         self.ssid_var = self._champ(corps, "Nom du réseau", self.config_actuelle["ssid"])
         self.mdp_var, self.entree_mdp = self._champ(corps, "Mot de passe",
                                                     self.config_actuelle["password"], secret=True)
-        self.label_aide_mdp = tk.Label(corps, text="", font=(POLICE, 8), bg=t["carte"],
+        self.label_aide_mdp = tk.Label(corps, text="", font=(POLICE, 10), bg=t["carte"],
                                        fg=t["texte_att"], anchor="w")
         self.label_aide_mdp.pack(fill="x", pady=px((2, 0)))
         outils = tk.Frame(corps, bg=t["carte"])
         outils.pack(fill="x", pady=px((10, 0)))
-        self.bouton_voir = BoutonPilule(outils, t, "Afficher", self._basculer_mdp, taille=9, hauteur=px(28))
+        self.bouton_voir = BoutonPilule(outils, t, "Afficher", self._basculer_mdp, taille=11, hauteur=px(28))
         self.bouton_voir.pack(side="left")
-        BoutonPilule(outils, t, "Générer", self._generer_mdp, taille=9, hauteur=px(28)).pack(side="left", padx=px(6))
-        self.bouton_copier = BoutonPilule(outils, t, "Copier", self._copier_mdp, taille=9, hauteur=px(28))
+        BoutonPilule(outils, t, "Générer", self._generer_mdp, taille=11, hauteur=px(28)).pack(side="left", padx=px(6))
+        self.bouton_copier = BoutonPilule(outils, t, "Copier", self._copier_mdp, taille=11, hauteur=px(28))
         self.bouton_copier.pack(side="left")
-        self.bouton_qr = BoutonPilule(outils, t, "QR code", self._basculer_qr, taille=9, hauteur=px(28),
+        self.bouton_qr = BoutonPilule(outils, t, "QR code", self._basculer_qr, taille=11, hauteur=px(28),
                                       style="bleu")
         self.bouton_qr.pack(side="right")
         self.cadre_qr = tk.Frame(corps, bg=t["carte"])
         self.bouton_appliquer = BoutonPilule(corps, t, "Appliquer les changements (redémarre le partage)",
-                                             self._on_demarrer, style="bleu", taille=9, hauteur=px(30))
+                                             self._on_demarrer, style="bleu", taille=11, hauteur=px(30))
         self.mdp_var.trace_add("write", self._sur_modif_reseau)
         self.ssid_var.trace_add("write", self._sur_modif_reseau)
         self.entree_mdp.bind("<Return>", lambda _e: self._on_demarrer())
@@ -813,7 +855,7 @@ class OptimaApp(tk.Tk):
         carte_a.pack(fill="x", padx=px(16), pady=px((0, 12)))
         self.cadre_appareils = carte_a.corps
         self.label_aucun = tk.Label(self.cadre_appareils, text="Aucun appareil connecté.",
-                                    font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"], anchor="w")
+                                    font=(POLICE, 12), bg=t["carte"], fg=t["texte_att"], anchor="w")
         self.label_aucun.pack(fill="x")
         self.lignes_appareils = {}
 
@@ -821,11 +863,23 @@ class OptimaApp(tk.Tk):
         self.carte_bloques = Carte(c, t, titre="APPAREILS BLOQUÉS")
         self.lignes_bloques = {}
 
-        self.label_message = tk.Label(c, text="", font=(POLICE, 9), bg=t["fond"],
-                                      fg=t["texte_att"], wraplength=px(430), justify="left", anchor="w")
+        self.label_message = tk.Label(c, text="", font=(POLICE, 11), bg=t["fond"],
+                                      fg=t["texte_att"], wraplength=px(490), justify="left", anchor="w")
         self.label_message.pack(fill="x", padx=px(22), pady=px((0, 16)))
 
-    def _defiler(self, delta):
+    def _defiler(self, delta, evenement=None):
+        try:
+            fen = evenement.widget.winfo_toplevel() if evenement is not None else self
+        except (AttributeError, KeyError, tk.TclError):
+            fen = self
+        cible = getattr(fen, "_defilement", None)
+        if cible:
+            toile, contenu = cible
+            if toile.winfo_exists() and contenu.winfo_reqheight() > toile.winfo_height():
+                toile.yview_scroll(delta, "units")
+            return
+        if fen is not self:
+            return
         if self.toile.winfo_exists() and self.contenu.winfo_reqheight() > self.toile.winfo_height():
             self.toile.yview_scroll(delta, "units")
 
@@ -838,13 +892,13 @@ class OptimaApp(tk.Tk):
 
     def _champ(self, parent, libelle, valeur, secret=False):
         t = self.t
-        tk.Label(parent, text=libelle, font=(POLICE, 9), bg=t["carte"], fg=t["texte_att"],
+        tk.Label(parent, text=libelle, font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"],
                  anchor="w").pack(fill="x", pady=px((6, 3)))
         cadre = tk.Frame(parent, bg=t["champ"], highlightthickness=1,
                          highlightbackground=t["bordure"], highlightcolor=t["bleu"])
         cadre.pack(fill="x")
         variable = tk.StringVar(value=valeur)
-        entree = tk.Entry(cadre, textvariable=variable, font=(POLICE, 11), bg=t["champ"],
+        entree = tk.Entry(cadre, textvariable=variable, font=(POLICE, 12), bg=t["champ"],
                           fg=t["texte"], insertbackground=t["texte"], relief="flat",
                           highlightthickness=0, show="•" if secret else "")
         entree.pack(fill="x", padx=px(10), ipady=px(6))
@@ -917,7 +971,7 @@ class OptimaApp(tk.Tk):
         ssid, mdp = self.ssid_var.get().strip(), self.mdp_var.get()
         if not ssid or len(mdp) < 8:
             tk.Label(self.cadre_qr, text="Renseigne un nom et un mot de passe valides.",
-                     font=(POLICE, 9), bg=t["carte"], fg=t["texte_att"]).pack(pady=px(8))
+                     font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"]).pack(pady=px(8))
         else:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             chemin = CACHE_DIR / "qr.png"
@@ -928,7 +982,7 @@ class OptimaApp(tk.Tk):
             lab.image = image
             lab.pack(pady=px((12, 4)))
             tk.Label(self.cadre_qr, text="Scanne ce code avec l'appareil à connecter.",
-                     font=(POLICE, 9), bg=t["carte"], fg=t["texte_att"]).pack()
+                     font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"]).pack()
         if not self.cadre_qr.winfo_ismapped():
             self.cadre_qr.pack(fill="x")
 
@@ -987,15 +1041,15 @@ class OptimaApp(tk.Tk):
         haut.pack(fill="x")
         signal = tk.Canvas(haut, width=px(22), height=px(18), bg=t["carte"], highlightthickness=0)
         signal.pack(side="left", padx=px((0, 8)))
-        nom = tk.Label(haut, text="", font=(POLICE, 11, "bold"), bg=t["carte"], fg=t["texte"],
-                       anchor="w", cursor="hand2")
+        nom = tk.Label(haut, text="", font=(POLICE, 12, "bold"), bg=t["carte"], fg=t["texte"],
+                       anchor="w")
         nom.pack(side="left")
         nom.bind("<Button-1>", lambda _e: self._renommer(mac))
-        etat = tk.Label(haut, text="", font=(POLICE, 9, "bold"), bg=t["carte"], fg=t["orange"])
+        etat = tk.Label(haut, text="", font=(POLICE, 11, "bold"), bg=t["carte"], fg=t["orange"])
         etat.pack(side="right")
-        details = tk.Label(cadre, text="", font=(POLICE, 9), bg=t["carte"], fg=t["texte_att"], anchor="w")
+        details = tk.Label(cadre, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"], anchor="w")
         details.pack(fill="x", padx=px((30, 0)))
-        conso = tk.Label(cadre, text="", font=(POLICE, 9), bg=t["carte"], fg=t["texte_att"], anchor="w")
+        conso = tk.Label(cadre, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"], anchor="w")
         conso.pack(fill="x", padx=px((30, 0)))
         boutons = tk.Frame(cadre, bg=t["carte"])
         boutons.pack(fill="x", padx=px((30, 0)), pady=px((6, 0)))
@@ -1004,13 +1058,13 @@ class OptimaApp(tk.Tk):
         ligne["bouton_couper"] = BoutonPilule(
             boutons, t, "Couper Internet",
             lambda: self._action_appareil("restore" if ligne["coupe"] else "cut", mac),
-            taille=9, hauteur=px(26))
+            taille=11, hauteur=px(26))
         ligne["bouton_couper"].pack(side="left")
         BoutonPilule(boutons, t, "Déconnecter et bloquer",
                      lambda: self._action_appareil("kick", mac), style="danger",
-                     taille=9, hauteur=px(26)).pack(side="left", padx=px(6))
+                     taille=11, hauteur=px(26)).pack(side="left", padx=px(6))
         BoutonPilule(boutons, t, "Renommer", lambda: self._renommer(mac),
-                     taille=9, hauteur=px(26)).pack(side="left")
+                     taille=11, hauteur=px(26)).pack(side="left")
         tk.Frame(cadre, bg=t["bordure"], height=max(1, px(1))).pack(fill="x", pady=px((10, 0)))
         return ligne
 
@@ -1035,10 +1089,10 @@ class OptimaApp(tk.Tk):
             ligne = tk.Frame(self.carte_bloques.corps, bg=t["carte"])
             ligne.pack(fill="x", pady=px(3))
             nom = self.config_actuelle["surnoms"].get(mac) or self._nom_historique(mac) or mac
-            tk.Label(ligne, text=nom, font=(POLICE, 10), bg=t["carte"], fg=t["texte"],
+            tk.Label(ligne, text=nom, font=(POLICE, 12), bg=t["carte"], fg=t["texte"],
                      anchor="w").pack(side="left")
             BoutonPilule(ligne, t, "Débloquer", lambda m=mac: self._action_appareil("unblock", m),
-                         style="bleu", taille=9, hauteur=px(26)).pack(side="right")
+                         style="bleu", taille=11, hauteur=px(26)).pack(side="right")
             self.lignes_bloques[mac] = ligne
         if bloques and not self.carte_bloques.winfo_ismapped():
             self.carte_bloques.pack(fill="x", padx=px(16), pady=px((0, 12)), before=self.label_message)
@@ -1059,12 +1113,12 @@ class OptimaApp(tk.Tk):
         fen.transient(self)
         actuel = self.config_actuelle["surnoms"].get(mac, "")
         app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {})
-        tk.Label(fen, text="Nom de l'appareil", font=(POLICE, 12, "bold"), bg=t["fond"],
+        tk.Label(fen, text="Nom de l'appareil", font=(POLICE, 13, "bold"), bg=t["fond"],
                  fg=t["texte"]).pack(padx=px(20), pady=px((18, 4)), anchor="w")
-        tk.Label(fen, text=f"{app.get('hostname', '')}  ·  {mac}", font=(POLICE, 9),
+        tk.Label(fen, text=f"{app.get('hostname', '')}  ·  {mac}", font=(POLICE, 11),
                  bg=t["fond"], fg=t["texte_att"]).pack(padx=px(20), anchor="w")
         var = tk.StringVar(value=actuel or app.get("hostname", ""))
-        entree = tk.Entry(fen, textvariable=var, font=(POLICE, 11), bg=t["carte"], fg=t["texte"],
+        entree = tk.Entry(fen, textvariable=var, font=(POLICE, 12), bg=t["carte"], fg=t["texte"],
                           insertbackground=t["texte"], relief="flat", highlightthickness=1,
                           highlightbackground=t["bordure"], width=32)
         entree.pack(padx=px(20), pady=px(12), ipady=px(6), fill="x")
@@ -1090,12 +1144,65 @@ class OptimaApp(tk.Tk):
                      fond_parent=t["fond"]).pack(side="right", padx=px(8))
         fen.after(100, lambda: _premier_plan(fen))
 
+    def _demander(self, titre, detail="", oui="Oui", non="Annuler", style_oui="principal", parent=None):
+        """Confirmation aux couleurs d'Optima (remplace la petite boite Tk en anglais).
+        Renvoie True si l'utilisateur choisit le bouton `oui`."""
+        t = self.t
+        parent = parent or self
+        d = tk.Toplevel(parent, bg=t["fond"])
+        d.title("Optima")
+        d.transient(parent)
+        d.resizable(False, False)
+        reponse = {"oui": False}
+
+        def fermer(valeur):
+            reponse["oui"] = valeur
+            d.destroy()
+
+        tk.Label(d, text=titre, font=(POLICE, 15, "bold"), bg=t["fond"], fg=t["texte"],
+                 wraplength=px(400), justify="left", anchor="w").pack(fill="x", padx=px(26), pady=px((24, 8)))
+        if detail:
+            tk.Label(d, text=detail, font=(POLICE, 12), bg=t["fond"], fg=t["texte_att"],
+                     wraplength=px(400), justify="left", anchor="w").pack(fill="x", padx=px(26))
+        bas = tk.Frame(d, bg=t["fond"])
+        bas.pack(fill="x", padx=px(26), pady=px((22, 22)))
+        BoutonPilule(bas, t, oui, lambda: fermer(True), style=style_oui, taille=12, hauteur=px(40),
+                     fond_parent=t["fond"]).pack(side="right")
+        BoutonPilule(bas, t, non, lambda: fermer(False), taille=12, hauteur=px(40),
+                     fond_parent=t["fond"]).pack(side="right", padx=px(10))
+        d.bind("<Return>", lambda _e: fermer(True))
+        d.bind("<Escape>", lambda _e: fermer(False))
+        d.protocol("WM_DELETE_WINDOW", lambda: fermer(False))
+        d.update_idletasks()
+        largeur, hauteur = px(460), d.winfo_reqheight()
+        try:
+            x = parent.winfo_rootx() + (parent.winfo_width() - largeur) // 2
+            y = parent.winfo_rooty() + max(px(40), (parent.winfo_height() - hauteur) // 3)
+            taille = f"{largeur}x{hauteur}+{max(0, x)}+{max(0, y)}"
+        except tk.TclError:
+            taille = f"{largeur}x{hauteur}"
+        d.geometry(taille)
+
+        def afficher():
+            _premier_plan(d)
+            d.geometry(taille)
+            try:
+                d.grab_set()
+            except tk.TclError:
+                pass
+
+        d.after(100, afficher)
+        d.wait_window()
+        return reponse["oui"]
+
     def _action_appareil(self, action, mac):
         app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {"mac": mac})
         nom = self._nom_appareil(app)
-        if action == "kick" and not messagebox.askyesno(
-                "Optima", f"Déconnecter « {nom} » et l'empêcher de se reconnecter ?\n\n"
-                          "Tu pourras le débloquer plus tard.", parent=self):
+        if action == "kick" and not self._demander(
+                f"Déconnecter « {nom} » ?",
+                "Cet appareil sera déconnecté et ne pourra plus se reconnecter à ton partage. "
+                "Tu pourras le débloquer plus tard depuis la liste des appareils bloqués.",
+                oui="Déconnecter et bloquer", style_oui="danger"):
             return
         textes = {
             "cut": (f"Coupure d'Internet pour {nom}…", f"Internet coupé pour {nom}."),
@@ -1109,6 +1216,15 @@ class OptimaApp(tk.Tk):
     # -- actions principales -----------------------------------------------------------
     def _basculer(self):
         if self.etat.get("running"):
+            n = len(self.etat.get("devices") or [])
+            if n and self.config_actuelle.get("confirmer_arret", True):
+                _premier_plan(self)
+                if not self._demander(
+                        "Arrêter le partage ?",
+                        f"{n} appareil{'s sont encore connectés' if n > 1 else ' est encore connecté'} : "
+                        f"{'ils perdront' if n > 1 else 'il perdra'} Internet tout de suite.",
+                        oui="Arrêter le partage", style_oui="danger"):
+                    return
             self._on_arreter()
         else:
             self._on_demarrer()
@@ -1125,30 +1241,35 @@ class OptimaApp(tk.Tk):
         self.config_actuelle["ssid"] = ssid
         self.config_actuelle["password"] = mdp
         sauvegarder_config(self.config_actuelle)
-        mx = str(self.config_actuelle.get("max_clients", 20))
-        bw = str(self.config_actuelle.get("bandwidth_mbps", 0))
-        self._executer(lambda: executer_privilegie("start", ssid, mdp, mx, bw),
+        args = self._args_demarrage(ssid, mdp)
+        self._executer(lambda: executer_privilegie(*args),
                        "Démarrage du point d'accès…", "Point d'accès démarré.", notifier=True)
 
-    def _on_arreter(self, auto=False):
+    def _args_demarrage(self, ssid, mdp):
+        c = self.config_actuelle
+        return ("start", ssid, mdp, str(c.get("max_clients", 20)), str(c.get("bandwidth_mbps", 0)),
+                "1" if c.get("reseau_masque") else "0", "1" if c.get("isoler_appareils") else "0",
+                c.get("dns", "auto") if c.get("dns") in ("auto", "cloudflare", "google", "quad9") else "auto")
+
+    def _on_arreter(self, auto=False, raison=None):
         self.arret_programme = None
         self.duree_arret = 0
         self.bouton_arret_prog.configurer(texte="Jamais")
         self._executer(lambda: executer_privilegie("stop"), "Arrêt du point d'accès…",
-                       "Partage arrêté automatiquement." if auto else "Partage arrêté.", notifier=True)
+                       raison or ("Partage arrêté automatiquement." if auto else "Partage arrêté."),
+                       notifier=True)
 
     def _demarrage_auto(self):
         ssid = self.config_actuelle.get("ssid", "").strip()
         mdp = self.config_actuelle.get("password", "")
         if not ssid or len(mdp) < 8:
             return
-        mx = str(self.config_actuelle.get("max_clients", 20))
-        bw = str(self.config_actuelle.get("bandwidth_mbps", 0))
+        args = self._args_demarrage(ssid, mdp)
 
         def action():
             ok, sortie = False, ""
             for _ in range(24):
-                ok, sortie = executer_privilegie("start", ssid, mdp, mx, bw)
+                ok, sortie = executer_privilegie(*args)
                 if ok or "aucune connexion wi-fi active" not in sortie.lower():
                     break
                 time.sleep(5)
@@ -1231,6 +1352,11 @@ class OptimaApp(tk.Tk):
                 self.label_sous_etat.config(
                     text=f"« {lire_ssid_en_service() or self.config_actuelle['ssid']} » · "
                          f"depuis {format_duree(maintenant - self._session_depart)}")
+            delai = int(self.config_actuelle.get("arret_inactif_min", 0) or 0)
+            if (delai > 0 and self._sans_appareil_depuis and self.etat.get("running")
+                    and not self._occupe and maintenant - self._sans_appareil_depuis >= delai * 60):
+                self._sans_appareil_depuis = None
+                self._on_arreter(auto=True, raison=f"Aucun appareil depuis {delai} min : partage arrêté.")
             if self.arret_programme:
                 if maintenant >= self.arret_programme and self.etat.get("running") and not self._occupe:
                     self._on_arreter(auto=True)
@@ -1249,17 +1375,27 @@ class OptimaApp(tk.Tk):
             etat = lire_statut()
             stations = lire_stations() if etat.get("running") else {}
             source = nom_reseau_source(etat.get("uplink")) if etat.get("uplink") not in (None, "null") else None
-            self._en_main(lambda: self._appliquer_statut(etat, stations, source))
+            # Theme "Auto" : suit en direct le mode clair/sombre de GNOME
+            mode = theme_systeme() if self.config_actuelle.get("theme", "auto") not in THEMES else None
+            self._en_main(lambda: self._appliquer_statut(etat, stations, source, mode))
 
         threading.Thread(target=tache, daemon=True).start()
 
-    def _appliquer_statut(self, etat, stations, source):
+    def _appliquer_statut(self, etat, stations, source, mode=None):
+        if mode in THEMES and THEMES[mode] is not self.t and not self._occupe:
+            self._reconstruire()   # relit le statut juste apres, avec les nouvelles couleurs
+            return
         t = self.t
         self.etat, self.stations = etat, stations
         actif = bool(etat.get("running"))
         if not self._occupe:
             self.bouton_marche.definir("marche" if actif else "arret")
         appareils = etat.get("devices") or []
+        if actif and not appareils:
+            if self._sans_appareil_depuis is None:
+                self._sans_appareil_depuis = time.time()
+        else:
+            self._sans_appareil_depuis = None
         if actif:
             self._session_depart = debut_du_partage()
             self.label_etat.config(text="Partage actif", fg=t["accent"])
@@ -1278,7 +1414,8 @@ class OptimaApp(tk.Tk):
         self._afficher_appareils(appareils)
         self._afficher_bloques([m.lower() for m in etat.get("blocked") or []])
         self._maj_bouton_appliquer()
-        if TRAY_DISPONIBLE and self.icone_tray:
+        if TRAY_DISPONIBLE and self.icone_tray and getattr(self, "_tray_actif", None) != actif:
+            self._tray_actif = actif
             self.icone_tray.icon = image_icone_tray(actif)
             self.icone_tray.title = f"Optima — {'actif' if actif else 'arrêté'}"
 
@@ -1309,83 +1446,165 @@ class OptimaApp(tk.Tk):
     # -- fenetres secondaires ---------------------------------------------------------
     def _ouvrir_parametres(self):
         t = self.t
+        ancienne = getattr(self, "_fen_reglages", None)
+        if ancienne is not None and ancienne.winfo_exists():
+            _premier_plan(ancienne)
+            return
         fen = tk.Toplevel(self, bg=t["fond"])
+        self._fen_reglages = fen
         fen.title("Réglages")
         fen.transient(self)
-        fen.resizable(False, False)
+        fen.resizable(True, True)
+        fen.minsize(px(380), px(320))
+        textes_aide = []   # leur largeur suit celle de la fenetre
         cfg = self.config_actuelle
         var_auto = tk.BooleanVar(value=cfg.get("auto_start", False))
+        var_ouverture = tk.BooleanVar(value=cfg.get("partage_ouverture", False))
+        var_fermeture = tk.StringVar(value=cfg.get("fermeture", "reduire"))
         var_notif = tk.BooleanVar(value=cfg.get("notifier_appareils", True))
         var_max = tk.IntVar(value=cfg.get("max_clients", 20))
         var_debit = tk.IntVar(value=cfg.get("bandwidth_mbps", 0))
+        var_masque = tk.BooleanVar(value=cfg.get("reseau_masque", False))
+        var_isoler = tk.BooleanVar(value=cfg.get("isoler_appareils", False))
+        var_dns = tk.StringVar(value=cfg.get("dns", "auto"))
+        var_inactif = tk.StringVar(value=str(cfg.get("arret_inactif_min", 0)))
+        var_confirmer = tk.BooleanVar(value=cfg.get("confirmer_arret", True))
         var_theme = tk.StringVar(value=cfg.get("theme", "auto"))
 
-        tk.Label(fen, text="Réglages", font=(POLICE, 16, "bold"), bg=t["fond"],
-                 fg=t["texte"]).pack(anchor="w", padx=px(20), pady=px((18, 10)))
-        carte = Carte(fen, t)
-        carte.pack(fill="x", padx=px(16))
-        corps = carte.corps
+        # boutons du bas fixes, le reste defile
+        bas = tk.Frame(fen, bg=t["fond"])
+        bas.pack(side="bottom", fill="x", padx=px(20), pady=px((10, 18)))
+        toile = tk.Canvas(fen, bg=t["fond"], highlightthickness=0, bd=0)
+        toile.pack(side="top", fill="both", expand=True)
+        contenu = tk.Frame(toile, bg=t["fond"])
+        id_contenu = toile.create_window(0, 0, window=contenu, anchor="nw")
+        contenu.bind("<Configure>", lambda _e: toile.configure(scrollregion=toile.bbox("all")))
+        def sur_redim(e):
+            toile.itemconfig(id_contenu, width=e.width)
+            for lab in textes_aide:
+                lab.config(wraplength=max(px(200), e.width - px(150)))
+        toile.bind("<Configure>", sur_redim)
+        fen._defilement = (toile, contenu)
 
-        def ligne_interrupteur(texte, var, aide=None):
-            l = tk.Frame(corps, bg=t["carte"])
-            l.pack(fill="x", pady=px(6))
+        tk.Label(contenu, text="Réglages", font=(POLICE, 16, "bold"), bg=t["fond"],
+                 fg=t["texte"]).pack(anchor="w", padx=px(20), pady=px((18, 4)))
+
+        def section(titre):
+            carte = Carte(contenu, t, titre=titre)
+            carte.pack(fill="x", padx=px(16), pady=px((10, 0)))
+            return carte.corps
+
+        def bloc_texte(corps, l, texte, aide):
             bloc = tk.Frame(l, bg=t["carte"])
             bloc.pack(side="left", fill="x", expand=True)
-            tk.Label(bloc, text=texte, font=(POLICE, 10), bg=t["carte"], fg=t["texte"],
+            tk.Label(bloc, text=texte, font=(POLICE, 12), bg=t["carte"], fg=t["texte"],
                      anchor="w").pack(fill="x")
             if aide:
-                tk.Label(bloc, text=aide, font=(POLICE, 8), bg=t["carte"], fg=t["texte_att"],
-                         anchor="w", wraplength=px(280), justify="left").pack(fill="x")
-            Interrupteur(l, t, var).pack(side="right")
+                lab = tk.Label(bloc, text=aide, font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"],
+                               anchor="w", wraplength=px(270), justify="left")
+                lab.pack(fill="x")
+                textes_aide.append(lab)
 
-        def ligne_nombre(texte, var, mini, maxi, pas=1, aide=None):
+        def ligne_interrupteur(corps, texte, var, aide=None):
             l = tk.Frame(corps, bg=t["carte"])
             l.pack(fill="x", pady=px(6))
-            bloc = tk.Frame(l, bg=t["carte"])
-            bloc.pack(side="left", fill="x", expand=True)
-            tk.Label(bloc, text=texte, font=(POLICE, 10), bg=t["carte"], fg=t["texte"],
-                     anchor="w").pack(fill="x")
-            if aide:
-                tk.Label(bloc, text=aide, font=(POLICE, 8), bg=t["carte"], fg=t["texte_att"],
-                         anchor="w").pack(fill="x")
+            Interrupteur(l, t, var).pack(side="right", anchor="n", pady=px((2, 0)))
+            bloc_texte(corps, l, texte, aide)
+
+        def ligne_nombre(corps, texte, var, mini, maxi, pas=1, aide=None):
+            l = tk.Frame(corps, bg=t["carte"])
+            l.pack(fill="x", pady=px(6))
             tk.Spinbox(l, from_=mini, to=maxi, increment=pas, textvariable=var, width=5,
-                       font=(POLICE, 10), bg=t["champ"], fg=t["texte"], insertbackground=t["texte"],
+                       font=(POLICE, 12), bg=t["champ"], fg=t["texte"], insertbackground=t["texte"],
                        buttonbackground=t["bouton"], relief="flat", highlightthickness=1,
                        highlightbackground=t["bordure"], justify="center").pack(side="right", ipady=px(3))
+            bloc_texte(corps, l, texte, aide)
 
-        ligne_interrupteur("Démarrer à l'ouverture de session", var_auto)
-        ligne_interrupteur("Notifier les connexions", var_notif,
+        def ligne_choix(corps, texte, var, options, aide=None):
+            """Libelle puis une rangee de pilules ; la pilule choisie est en bleu."""
+            l = tk.Frame(corps, bg=t["carte"])
+            l.pack(fill="x", pady=px(6))
+            haut = tk.Frame(l, bg=t["carte"])
+            haut.pack(fill="x")
+            bloc_texte(corps, haut, texte, aide)
+            rangee = tk.Frame(l, bg=t["carte"])
+            rangee.pack(fill="x", pady=px((6, 0)))
+            boutons = {}
+
+            def choisir(v):
+                var.set(v)
+                for k, b in boutons.items():
+                    b.configurer(style="bleu" if k == v else "secondaire")
+
+            for v, lib in options:
+                b = BoutonPilule(rangee, t, lib, lambda v=v: choisir(v), taille=11, hauteur=px(28))
+                b.pack(side="left", padx=px((0, 6)))
+                boutons[v] = b
+            choisir(var.get() if var.get() in boutons else options[0][0])
+
+        # -- Demarrage
+        c = section("DÉMARRAGE")
+        ligne_interrupteur(c, "Démarrer à l'ouverture de session", var_auto,
+                           "Optima se lance discrètement et partage ta connexion.")
+        ligne_interrupteur(c, "Partager dès l'ouverture d'Optima", var_ouverture,
+                           "Le partage démarre tout seul quand tu ouvres l'appli.")
+        ligne_choix(c, "Quand je ferme la fenêtre", var_fermeture,
+                    (("reduire", "Réduire dans la barre"), ("quitter", "Quitter Optima")),
+                    "Le partage continue dans les deux cas.")
+
+        # -- Reseau
+        c = section("RÉSEAU")
+        ligne_interrupteur(c, "Réseau masqué", var_masque,
+                           "Le nom du réseau n'apparaît plus dans les listes Wi-Fi : "
+                           "il faut le taper à la main (ou scanner le QR code).")
+        ligne_interrupteur(c, "Isoler les appareils", var_isoler,
+                           "Les appareils connectés ont Internet mais ne se voient pas "
+                           "entre eux (plus sûr avec des invités).")
+        ligne_choix(c, "DNS des appareils", var_dns,
+                    (("auto", "Auto"), ("cloudflare", "Cloudflare"), ("google", "Google"), ("quad9", "Quad9")),
+                    "Auto = celui du réseau partagé. Les autres peuvent accélérer "
+                    "l'ouverture des sites ; Quad9 bloque aussi des sites malveillants.")
+        ligne_nombre(c, "Appareils maximum", var_max, 1, 50)
+        ligne_nombre(c, "Limite de débit (Mbit/s)", var_debit, 0, 1000, 5, "0 = illimité")
+
+        # -- Arret
+        c = section("ARRÊT ET ÉCONOMIE")
+        ligne_choix(c, "Arrêter si plus aucun appareil depuis", var_inactif,
+                    (("0", "Jamais"), ("5", "5 min"), ("10", "10 min"), ("30", "30 min")),
+                    "Économise la batterie. Ton mot de passe sera demandé au moment de l'arrêt.")
+        ligne_interrupteur(c, "Confirmer avant d'arrêter", var_confirmer,
+                           "Demande confirmation si des appareils sont encore connectés.")
+
+        # -- Notifications et apparence
+        c = section("NOTIFICATIONS ET APPARENCE")
+        ligne_interrupteur(c, "Notifier les connexions", var_notif,
                            "Une notification quand un appareil se connecte ou part.")
-        ligne_nombre("Appareils maximum", var_max, 1, 50)
-        ligne_nombre("Limite de débit (Mbit/s)", var_debit, 0, 1000, 5, "0 = illimité")
+        ligne_choix(c, "Apparence", var_theme, (("auto", "Auto"), ("clair", "Clair"), ("sombre", "Sombre")))
 
-        l = tk.Frame(corps, bg=t["carte"])
-        l.pack(fill="x", pady=px((10, 4)))
-        tk.Label(l, text="Apparence", font=(POLICE, 10), bg=t["carte"], fg=t["texte"]).pack(side="left")
-        boutons_theme = {}
-
-        def choisir_theme(v):
-            var_theme.set(v)
-            for k, b in boutons_theme.items():
-                b.configurer(style="bleu" if k == v else "secondaire")
-
-        for v, lib in (("sombre", "Sombre"), ("clair", "Clair"), ("auto", "Auto")):
-            b = BoutonPilule(l, t, lib, lambda v=v: choisir_theme(v), taille=9, hauteur=px(26))
-            b.pack(side="right", padx=px((4, 0)))
-            boutons_theme[v] = b
-        choisir_theme(var_theme.get())
-
-        tk.Label(fen, text="La limite de débit et le nombre maximum s'appliquent au prochain démarrage du partage.",
-                 font=(POLICE, 8), bg=t["fond"], fg=t["texte_att"], wraplength=px(380),
-                 justify="left").pack(anchor="w", padx=px(20), pady=px((8, 0)))
+        texte_bas = "Les réglages Réseau s'appliquent au prochain démarrage du partage."
+        if self.etat.get("running"):
+            texte_bas = ("Le partage est actif : les réglages Réseau s'appliqueront quand "
+                         "tu le relanceras.")
+        tk.Label(contenu, text=texte_bas, font=(POLICE, 10), bg=t["fond"], fg=t["texte_att"],
+                 wraplength=px(440), justify="left").pack(anchor="w", padx=px(20), pady=px((8, 4)))
 
         if est_admin():
-            self._construire_panneau_admin(fen)
+            self._construire_panneau_admin(contenu)
 
         def enregistrer():
             ancien_theme = cfg.get("theme", "auto")
             cfg["auto_start"] = var_auto.get()
+            cfg["partage_ouverture"] = var_ouverture.get()
+            cfg["fermeture"] = var_fermeture.get()
             cfg["notifier_appareils"] = var_notif.get()
+            cfg["reseau_masque"] = var_masque.get()
+            cfg["isoler_appareils"] = var_isoler.get()
+            cfg["dns"] = var_dns.get()
+            cfg["confirmer_arret"] = var_confirmer.get()
+            try:
+                cfg["arret_inactif_min"] = max(0, int(var_inactif.get()))
+            except ValueError:
+                cfg["arret_inactif_min"] = 0
             try:
                 cfg["max_clients"] = max(1, min(50, int(var_max.get())))
                 cfg["bandwidth_mbps"] = max(0, min(1000, int(var_debit.get())))
@@ -1395,18 +1614,38 @@ class OptimaApp(tk.Tk):
             sauvegarder_config(cfg)
             (activer_autostart if var_auto.get() else desactiver_autostart)()
             fen.destroy()
+            self._message("✓ Réglages enregistrés.", "accent")
             if cfg["theme"] != ancien_theme:
                 self._reconstruire()
 
-        bas = tk.Frame(fen, bg=t["fond"])
-        bas.pack(fill="x", padx=px(20), pady=px((16, 18)))
+        def par_defaut():
+            if not self._demander("Remettre les réglages par défaut ?",
+                                  "Le nom du réseau, le mot de passe et les surnoms des appareils sont gardés.",
+                                  oui="Remettre par défaut", parent=fen):
+                return
+            ancien_theme = cfg.get("theme", "auto")
+            for cle, valeur in CONFIG_PAR_DEFAUT.items():
+                if cle not in ("ssid", "password", "surnoms", "auto_start"):
+                    cfg[cle] = json.loads(json.dumps(valeur))
+            sauvegarder_config(cfg)
+            fen.destroy()
+            if cfg["theme"] != ancien_theme:
+                self._reconstruire()
+            self._ouvrir_parametres()
+
         BoutonPilule(bas, t, "Enregistrer", enregistrer, style="principal", hauteur=px(34),
                      fond_parent=t["fond"]).pack(side="right")
         BoutonPilule(bas, t, "Annuler", fen.destroy, hauteur=px(34),
                      fond_parent=t["fond"]).pack(side="right", padx=px(8))
+        BoutonPilule(bas, t, "Par défaut", par_defaut, hauteur=px(34), taille=11,
+                     fond_parent=t["fond"]).pack(side="left")
         fen.update_idletasks()
-        fen.geometry(f"{px(420)}x{max(fen.winfo_reqheight(), px(300))}")
-        fen.after(100, lambda: _premier_plan(fen))
+        hauteur = min(contenu.winfo_reqheight() + bas.winfo_reqheight() + px(30),
+                      px(640), fen.winfo_screenheight() - px(220))
+        taille = f"{px(500)}x{hauteur}"
+        fen.geometry(taille)
+        # GNOME ignore parfois la taille demandee avant l'affichage : on la redonne apres.
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
 
     def _reconstruire(self):
         valeurs = (self.ssid_var.get(), self.mdp_var.get())
@@ -1427,25 +1666,25 @@ class OptimaApp(tk.Tk):
         carte = Carte(fen, t, titre="PANNEAU ADMIN (cette machine seulement)")
         carte.pack(fill="x", padx=px(16), pady=px((12, 0)))
         var_cle = tk.StringVar(value="")
-        tk.Entry(carte.corps, textvariable=var_cle, font=(POLICE, 12, "bold"), justify="center",
+        tk.Entry(carte.corps, textvariable=var_cle, font=(POLICE, 13, "bold"), justify="center",
                  bg=t["champ"], fg=t["accent"], relief="flat", state="readonly",
                  readonlybackground=t["champ"]).pack(fill="x", ipady=px(8))
         l = tk.Frame(carte.corps, bg=t["carte"])
         l.pack(fill="x", pady=px((8, 0)))
         BoutonPilule(l, t, "Générer une clé", lambda: var_cle.set(generer_cle_licence()),
-                     taille=9, hauteur=px(28)).pack(side="left")
+                     taille=11, hauteur=px(28)).pack(side="left")
 
         def copier():
             self.clipboard_clear()
             self.clipboard_append(var_cle.get())
 
-        BoutonPilule(l, t, "Copier", copier, taille=9, hauteur=px(28)).pack(side="left", padx=px(6))
+        BoutonPilule(l, t, "Copier", copier, taille=11, hauteur=px(28)).pack(side="left", padx=px(6))
 
     def _ouvrir_historique(self):
         t = self.t
         fen = tk.Toplevel(self, bg=t["fond"])
         fen.title("Historique des connexions")
-        fen.geometry(f"{px(440)}x{px(520)}")
+        fen.geometry(f"{px(500)}x{px(560)}")
         fen.transient(self)
         tete = tk.Frame(fen, bg=t["fond"])
         tete.pack(fill="x", padx=px(20), pady=px((18, 10)))
@@ -1454,14 +1693,14 @@ class OptimaApp(tk.Tk):
 
         cadre = tk.Frame(fen, bg=t["carte"], highlightthickness=1, highlightbackground=t["bordure"])
         cadre.pack(fill="both", expand=True, padx=px(16), pady=px((0, 16)))
-        zone = tk.Text(cadre, bg=t["carte"], fg=t["texte"], relief="flat", font=(POLICE, 10),
-                       wrap="word", padx=px(12), pady=px(10), highlightthickness=0, cursor="arrow")
+        zone = tk.Text(cadre, bg=t["carte"], fg=t["texte"], relief="flat", font=(POLICE, 12),
+                       wrap="word", padx=px(12), pady=px(10), highlightthickness=0)
         defil = tk.Scrollbar(cadre, command=zone.yview, relief="flat", bd=0, width=px(10),
                              troughcolor=t["carte"], bg=t["bouton"], activebackground=t["bouton_survol"])
         zone.config(yscrollcommand=defil.set)
         defil.pack(side="right", fill="y")
         zone.pack(side="left", fill="both", expand=True)
-        zone.tag_configure("jour", font=(POLICE, 9, "bold"), foreground=t["texte_att"], spacing1=px(8), spacing3=px(4))
+        zone.tag_configure("jour", font=(POLICE, 11, "bold"), foreground=t["texte_att"], spacing1=px(8), spacing3=px(4))
         zone.tag_configure("on", foreground=t["accent"])
         zone.tag_configure("off", foreground=t["texte_att"])
         zone.tag_configure("heure", foreground=t["texte_att"])
@@ -1487,11 +1726,13 @@ class OptimaApp(tk.Tk):
             zone.config(state="disabled")
 
         def effacer():
-            if messagebox.askyesno("Optima", "Effacer tout l'historique ?", parent=fen):
+            if self._demander("Effacer tout l'historique ?",
+                              "La liste des connexions passées sera vidée. Cette action est définitive.",
+                              oui="Effacer", style_oui="danger", parent=fen):
                 HISTORY_PATH.write_text("[]")
                 remplir()
 
-        BoutonPilule(tete, t, "Effacer", effacer, style="danger", taille=9, hauteur=px(28),
+        BoutonPilule(tete, t, "Effacer", effacer, style="danger", taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right")
         remplir()
         fen.after(100, lambda: _premier_plan(fen))
@@ -1535,6 +1776,9 @@ class OptimaApp(tk.Tk):
         self.destroy()
 
     def _on_fermeture(self):
+        if self.config_actuelle.get("fermeture") == "quitter":
+            self._quitter()
+            return
         if self.icone_tray:
             if not self._averti_reduction:
                 envoyer_notification("Optima", "Optima continue dans la barre du haut. "
@@ -1548,6 +1792,7 @@ class OptimaApp(tk.Tk):
 class FenetreActivation(tk.Tk):
     def __init__(self, sur_succes):
         super().__init__(className="Optima")
+        _curseur_systeme(self)
         self.after(250, lambda: _premier_plan(self))
         t = THEMES[theme_systeme()]
         self.sur_succes = sur_succes
@@ -1557,15 +1802,15 @@ class FenetreActivation(tk.Tk):
         tk.Label(self, text="Optima", font=(POLICE, 20, "bold"), bg=t["fond"], fg=t["texte"]).pack(pady=px((28, 6)))
         tk.Label(self, text="Ce logiciel nécessite une clé d'activation.\n"
                             "Demande-la à la personne qui te l'a partagé.",
-                 font=(POLICE, 10), bg=t["fond"], fg=t["texte_att"]).pack(pady=px((0, 20)))
+                 font=(POLICE, 12), bg=t["fond"], fg=t["texte_att"]).pack(pady=px((0, 20)))
         self.var_cle = tk.StringVar()
-        entree = tk.Entry(self, textvariable=self.var_cle, font=(POLICE, 13), justify="center",
+        entree = tk.Entry(self, textvariable=self.var_cle, font=(POLICE, 14), justify="center",
                           bg=t["carte"], fg=t["texte"], insertbackground=t["texte"], relief="flat",
                           highlightthickness=1, highlightbackground=t["bordure"])
         entree.pack(fill="x", padx=px(32), ipady=px(8))
         entree.bind("<Return>", lambda _e: self._verifier())
         entree.focus_set()
-        self.label_erreur = tk.Label(self, text="", font=(POLICE, 9), bg=t["fond"], fg=t["rouge"])
+        self.label_erreur = tk.Label(self, text="", font=(POLICE, 11), bg=t["fond"], fg=t["rouge"])
         self.label_erreur.pack(pady=px((12, 0)))
         BoutonPilule(self, t, "Activer", self._verifier, style="principal", hauteur=px(38),
                      fond_parent=t["fond"]).pack(fill="x", padx=px(32), pady=px((16, 0)))
