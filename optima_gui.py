@@ -216,7 +216,8 @@ def desactiver_autostart():
 def envoyer_notification(titre, message):
     try:
         subprocess.Popen(
-            ["notify-send", "-a", "Optima", "-i", str(ICONE_APP), titre, message],
+            ["notify-send", "-a", "Optima", "-i", str(ICONE_APP),
+             "-h", "string:desktop-entry:optima", titre, message],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
