@@ -31,6 +31,7 @@ stop_all() {
     pkill -9 -f "dnsmasq --conf-file=$RUN_DIR/dnsmasq.conf" 2>/dev/null || true
     rm -f "$RUN_DIR/hostapd.pid" "$RUN_DIR/dnsmasq.pid"
     tc qdisc del dev "$AP_IFACE" root 2>/dev/null || true
+    tc qdisc del dev "$AP_IFACE" ingress 2>/dev/null || true
     sleep 1
 
     # Le retrait de l'interface peut echouer juste apres avoir tue hostapd
@@ -71,6 +72,8 @@ start_ap() {
     local hidden="${5:-0}"
     local isolate="${6:-0}"
     local dns="${7:-auto}"
+    # 26/11/2026 : limites de debit par appareil, "mac=kbit,mac=kbit" (optionnel)
+    local limites="${8:-}"
     [ "$hidden" = 1 ] || hidden=0
     [ "$isolate" = 1 ] || isolate=0
     local dns_clients
@@ -149,6 +152,14 @@ start_ap() {
     # que /run n'est pas efface, donc jusqu'au prochain redemarrage du PC).
     touch "$RUN_DIR/denylist"
 
+    # 26/11/2026 : limites de debit par appareil (Optima les redonne a chaque demarrage).
+    if [ -n "$limites" ]; then
+        echo "$limites" | tr ',' '\n' | awk -F= 'NF==2 && $1 ~ /^([0-9a-fA-F][0-9a-fA-F]:){5}[0-9a-fA-F][0-9a-fA-F]$/ && $2 ~ /^[0-9]+$/ && $2 > 0 {print tolower($1), $2}' > "$RUN_DIR/limits"
+    else
+        : > "$RUN_DIR/limits"
+    fi
+    echo "$bandwidth_mbps" > "$RUN_DIR/bandwidth"
+
     # 06/11/2026 (Optima v2) : socket de controle de hostapd lisible par le groupe de
     # l'utilisateur qui a lance Optima -> l'interface lit sans root le debit, le signal
     # et la duree de connexion de chaque appareil (hostapd_cli all_sta).
@@ -156,6 +167,13 @@ start_ap() {
     if [ -n "${PKEXEC_UID:-}" ]; then
         ctrl_group=$(id -g "$PKEXEC_UID" 2>/dev/null || echo 0)
     fi
+
+    # 26/11/2026 : mots de passe invites temporaires. hostapd accepte en plus du mot de
+    # passe principal ceux de ce fichier (keyid=invite) ; Optima l'ecrit sans root (groupe
+    # de l'utilisateur) et le recharge a chaud (hostapd_cli reload_wpa_psk).
+    : > "$RUN_DIR/invites.psk"
+    chgrp "$ctrl_group" "$RUN_DIR/invites.psk" 2>/dev/null || true
+    chmod 660 "$RUN_DIR/invites.psk"
 
     cat > "$RUN_DIR/hostapd.conf" <<EOF
 interface=$AP_IFACE
@@ -174,6 +192,7 @@ macaddr_acl=0
 deny_mac_file=$RUN_DIR/denylist
 ignore_broadcast_ssid=$hidden
 ap_isolate=$isolate
+wpa_psk_file=$RUN_DIR/invites.psk
 EOF
 
     local phy essai hostapd_ok=false
@@ -181,7 +200,9 @@ EOF
 
     # hostapd plante parfois (bug driver/etat transitoire) juste apres la
     # creation de l'interface virtuelle : jusqu'a 2 tentatives completes.
-    for essai in 1 2; do
+    for essai in 1 2 3; do
+        # 3e essai : sans le fichier des invites, au cas ou il empecherait hostapd de demarrer
+        [ "$essai" = 3 ] && sed -i '/^wpa_psk_file=/d' "$RUN_DIR/hostapd.conf"
         iw dev "$AP_IFACE" del 2>/dev/null || true
         sleep 1
         # 05/11/2026 (d'apres la note Optima de septembre) : adresse MAC aleatoire a chaque
@@ -233,11 +254,8 @@ EOF
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
-    # Limite de debit partagee (0 = illimite) : plafonne le trafic sortant
-    # vers les appareils connectes (download cote clients).
-    if [ "$bandwidth_mbps" -gt 0 ]; then
-        tc qdisc add dev "$AP_IFACE" root tbf rate "${bandwidth_mbps}mbit" burst 32kbit latency 400ms 2>/dev/null || true
-    fi
+    # Limite de debit globale et par appareil (voir appliquer_limites).
+    appliquer_limites || true
 
     # Chaine de coupure d'acces (par IP, ciblee par appareil) : toujours
     # evaluee en premier, pour qu'un appareil "coupe" ne ressorte jamais
@@ -302,6 +320,67 @@ sync_state() {
             fi
         fi
     done < "$RUN_DIR/dnsmasq.leases"
+}
+
+# 26/11/2026 : limites de debit. Reconstruit l'arbre tc de ap0 :
+#  - HTB a la racine : classe globale (limite generale, ou 1 Gbit/s si aucune), classe par
+#    defaut pour tout le monde, une classe par appareil limite (filtre sur son IP) -> debit
+#    descendant (ce que l'appareil recoit) ;
+#  - ingress + police par IP source -> debit montant (ce que l'appareil envoie).
+# Sans aucune limite, ap0 reste sans file speciale (comme avant).
+appliquer_limites() {
+    local total mac kbit ip id n=16 ingress=false
+    total=$(cat "$RUN_DIR/bandwidth" 2>/dev/null)
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    tc qdisc del dev "$AP_IFACE" root 2>/dev/null || true
+    tc qdisc del dev "$AP_IFACE" ingress 2>/dev/null || true
+    if [ "$total" -eq 0 ] && [ ! -s "$RUN_DIR/limits" ]; then
+        return 0
+    fi
+    [ "$total" -eq 0 ] && total=1000
+    tc qdisc add dev "$AP_IFACE" root handle 1: htb default 2 || return 0
+    tc class add dev "$AP_IFACE" parent 1: classid 1:1 htb rate "${total}mbit" ceil "${total}mbit"
+    tc class add dev "$AP_IFACE" parent 1:1 classid 1:2 htb rate "${total}mbit" ceil "${total}mbit"
+    tc qdisc add dev "$AP_IFACE" parent 1:2 fq_codel 2>/dev/null || true
+    [ -s "$RUN_DIR/limits" ] || return 0
+    while read -r mac kbit; do
+        [ -z "$mac" ] && continue
+        ip=$(awk -v m="$mac" 'tolower($2)==m{print $3}' "$RUN_DIR/dnsmasq.leases" 2>/dev/null | tail -1)
+        [ -z "$ip" ] && continue
+        n=$((n + 1))
+        id=$(printf '%x' "$n")
+        tc class add dev "$AP_IFACE" parent 1:1 classid "1:$id" htb rate "${kbit}kbit" ceil "${kbit}kbit"
+        tc qdisc add dev "$AP_IFACE" parent "1:$id" fq_codel 2>/dev/null || true
+        tc filter add dev "$AP_IFACE" parent 1: protocol ip prio 1 u32 match ip dst "$ip/32" flowid "1:$id"
+        if [ "$ingress" = false ]; then
+            tc qdisc add dev "$AP_IFACE" handle ffff: ingress 2>/dev/null || true
+            ingress=true
+        fi
+        tc filter add dev "$AP_IFACE" parent ffff: protocol ip prio 1 u32 match ip src "$ip/32" \
+            police rate "${kbit}kbit" burst 64k drop flowid :1 2>/dev/null || true
+    done < "$RUN_DIR/limits"
+}
+
+# limit MAC KBIT : fixe (KBIT > 0) ou retire (0) la limite d'un appareil, a chaud,
+# sans toucher au reste du partage.
+limit_mac() {
+    local mac kbit
+    mac=$(echo "${1:-}" | tr 'A-Z' 'a-z')
+    kbit="${2:-0}"
+    if ! echo "$mac" | grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
+        echo "ERREUR: adresse MAC invalide" >&2
+        exit 1
+    fi
+    case "$kbit" in ''|*[!0-9]*) echo "ERREUR: debit invalide" >&2; exit 1 ;; esac
+    touch "$RUN_DIR/limits"
+    awk -v m="$mac" '$1!=m' "$RUN_DIR/limits" > "$RUN_DIR/limits.tmp"
+    if [ "$kbit" -gt 0 ]; then echo "$mac $kbit" >> "$RUN_DIR/limits.tmp"; fi
+    mv "$RUN_DIR/limits.tmp" "$RUN_DIR/limits"
+    if [ -f "$RUN_DIR/hostapd.pid" ] && [ -d "/proc/$(cat "$RUN_DIR/hostapd.pid" 2>/dev/null)" ]; then
+        [ -f "$RUN_DIR/bandwidth" ] || echo 0 > "$RUN_DIR/bandwidth"
+        appliquer_limites || true
+    fi
+    echo "OK"
 }
 
 # Lit les compteurs de la chaine OPTIMA_ACCT (via iptables-save, seul
@@ -497,7 +576,7 @@ status() {
 }
 
 case "$1" in
-    start) start_ap "$2" "$3" "$4" "$5" "$6" "$7" "$8" ;;
+    start) start_ap "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" ;;
     stop) stop_all; echo "OK" ;;
     status) status ;;
     kick) kick_mac "$2" ;;
@@ -505,5 +584,6 @@ case "$1" in
     cut) cut_internet "$2" ;;
     restore) restore_internet "$2" ;;
     sync) sync_and_report ;;
-    *) echo "Usage: $0 {start SSID PASSWORD [MAX_CLIENTS] [BANDWIDTH_MBPS]|stop|status|kick MAC|unblock MAC|cut MAC|restore MAC|sync}" >&2; exit 1 ;;
+    limit) limit_mac "$2" "$3" ;;
+    *) echo "Usage: $0 {start SSID PASSWORD [MAX_CLIENTS] [BANDWIDTH_MBPS]|stop|status|kick MAC|unblock MAC|cut MAC|restore MAC|sync|limit MAC KBIT}" >&2; exit 1 ;;
 esac

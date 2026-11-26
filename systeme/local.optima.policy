@@ -45,4 +45,11 @@
     <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/unblock</annotate>
   </action>
+  <action id="local.optima.limit">
+    <description>Optima : limit</description>
+    <message>Optima a besoin de ton mot de passe pour limiter le débit d’un appareil connecté.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/limit</annotate>
+  </action>
 </policyconfig>

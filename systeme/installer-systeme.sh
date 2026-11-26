@@ -16,7 +16,7 @@ install -m 644 "$ICI/99-optima-ap0.conf" /etc/NetworkManager/conf.d/99-optima-ap
 nmcli general reload conf 2>/dev/null || true
 
 install -d -m 755 /usr/local/libexec/optima
-for action in start stop cut restore kick unblock; do
+for action in start stop cut restore kick unblock limit; do
     cat > "/usr/local/libexec/optima/$action" <<LANCEUR
 #!/bin/bash
 # Lanceur root d'Optima ($action) : polkit affiche un message lisible au lieu de la commande.

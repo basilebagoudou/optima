@@ -16,6 +16,10 @@ Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card i
 - Sharing schedule: start and stop at fixed hours on chosen days (overnight ranges supported)
 - Source connection monitoring: live ping and packet loss, captive-portal detection with a button to open the login page, notifications when Internet drops or comes back
 - Statistics window: daily chart over 7 / 30 / 90 days, top devices, CSV export
+- Guest access: a second, temporary password for the same network (1 h / 3 h / 24 h, QR code, extend or revoke); guests are disconnected when it expires
+- Allowed-devices mode: unknown devices are refused instantly and listed under "Connection requests" so you can allow them in one click
+- Per-device speed limit (download and upload), applied live without disconnecting the device
+- Built-in speed test of the shared connection (ping, download, upload, last results)
 - Light and dark themes (follows the GNOME setting, or forced in Settings), rounded macOS-like design, HiDPI aware
 - Tray icon, system notifications (can be turned off), connection history grouped by day
 - Device count and shared bandwidth limits

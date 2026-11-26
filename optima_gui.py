@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import tkinter.font as tkfont
 from collections import deque
 from datetime import date, datetime, timedelta
@@ -133,6 +134,12 @@ CONFIG_PAR_DEFAUT = {
     "planning_fin": "23:00",
     "planning_jours": [0, 1, 2, 3, 4, 5, 6],   # 0 = lundi
     "surveiller_connexion": True, # ping + detection du portail captif du reseau source
+    # 26/11/2026 (2) : invites, liste blanche, debit par appareil, test de vitesse
+    "invite": None,               # {"mdp", "debut", "expire", "macs"} pendant un acces invite
+    "liste_blanche": False,       # seuls les appareils autorises peuvent se connecter
+    "appareils_autorises": [],
+    "limites_debit": {},          # mac -> kbit/s (debit maximum par appareil)
+    "tests_vitesse": [],          # derniers resultats [{"date", "ping", "bas", "haut"}]
 }
 
 ERREURS_CONNUES = {
@@ -176,6 +183,11 @@ def charger_config():
             pass
     if not isinstance(cfg.get("surnoms"), dict):
         cfg["surnoms"] = {}
+    for cle, type_ in (("limites_debit", dict), ("appareils_autorises", list), ("tests_vitesse", list)):
+        if not isinstance(cfg.get(cle), type_):
+            cfg[cle] = type_()
+    if cfg.get("invite") is not None and not isinstance(cfg.get("invite"), dict):
+        cfg["invite"] = None
     return cfg
 
 
@@ -658,6 +670,108 @@ def format_moment(t):
     return f"{jour} à {t:%H:%M}"
 
 
+# -- pilotage de hostapd sans root (socket de controle du groupe de l'utilisateur) ---------
+INVITES_PSK = RUN_DIR / "invites.psk"
+DEBITS_APPAREIL = [0, 1000, 2000, 5000, 10000]   # kbit/s, 0 = illimite
+
+
+def hostapd_cmd(*args):
+    try:
+        r = subprocess.run(["hostapd_cli", "-p", str(RUN_DIR / "hostapd_ctrl"), "-i", AP_IFACE, *args],
+                           capture_output=True, text=True, timeout=4)
+    except Exception as erreur:
+        return False, str(erreur)
+    sortie = r.stdout.strip()
+    return r.returncode == 0 and "FAIL" not in sortie and "UNKNOWN" not in sortie, sortie
+
+
+def lister_stations_rapide():
+    ok, sortie = hostapd_cmd("list_sta")
+    if not ok:
+        return None
+    return [l.strip().lower() for l in sortie.splitlines()
+            if re.fullmatch(r"[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}", l.strip())]
+
+
+def keyid_station(mac):
+    ok, sortie = hostapd_cmd("sta", mac)
+    m = re.search(r"^keyid=(\S+)", sortie, re.M) if ok else None
+    return m.group(1) if m else None
+
+
+def invites_disponibles():
+    """Le partage en cours a-t-il ete demarre avec le fichier des invites ?"""
+    try:
+        conf = (RUN_DIR / "hostapd.conf").read_text()
+    except OSError:
+        return False
+    return "wpa_psk_file=" in conf and os.access(INVITES_PSK, os.W_OK)
+
+
+def ecrire_invites(mdp):
+    contenu = f"keyid=invite 00:00:00:00:00:00 {mdp}\n" if mdp else ""
+    try:
+        if INVITES_PSK.read_text() == contenu:
+            return True
+    except OSError:
+        pass
+    try:
+        with open(INVITES_PSK, "w") as f:   # ecriture sur place : le dossier /run/optima est a root
+            f.write(contenu)
+    except OSError:
+        return False
+    return hostapd_cmd("reload_wpa_psk")[0]
+
+
+def generer_mdp_invite():
+    alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def format_kbit(kbit):
+    return f"{kbit / 1000:g} Mbit/s" if kbit >= 1000 else f"{kbit} kbit/s"
+
+
+# -- test de vitesse (serveurs de Cloudflare, sans compte) --------------------------------
+def test_descente(octets, rappel=None):
+    req = urllib.request.Request(f"https://speed.cloudflare.com/__down?bytes={octets}",
+                                 headers={"User-Agent": "Optima"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        recu, t0 = 0, None
+        while True:
+            morceau = r.read(65536)
+            if not morceau:
+                break
+            if t0 is None:
+                t0 = time.time()   # on ne compte pas l'etablissement de la connexion
+                continue
+            recu += len(morceau)
+            if rappel:
+                rappel(recu * 8 / max(0.001, time.time() - t0))
+    duree = max(0.001, time.time() - (t0 or time.time()))
+    return recu * 8 / duree
+
+
+def test_montee(octets):
+    donnees = secrets.token_bytes(octets)
+    req = urllib.request.Request("https://speed.cloudflare.com/__up", data=donnees, method="POST",
+                                 headers={"User-Agent": "Optima", "Content-Type": "application/octet-stream"})
+    # connexion d'abord (petit envoi), puis mesure du gros envoi
+    urllib.request.urlopen(urllib.request.Request(
+        "https://speed.cloudflare.com/__up", data=b"0", method="POST",
+        headers={"User-Agent": "Optima"}), timeout=15).read()
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=60) as r:
+        r.read()
+    return octets * 8 / max(0.001, time.time() - t0)
+
+
+def format_bits(bits_par_s):
+    if bits_par_s >= 1_000_000:
+        return f"{bits_par_s / 1_000_000:.1f} Mbit/s"
+    return f"{bits_par_s / 1000:.0f} kbit/s"
+
+
 def dossier_documents():
     try:
         d = subprocess.run(["xdg-user-dir", "DOCUMENTS"], capture_output=True, text=True,
@@ -966,6 +1080,12 @@ class OptimaApp(tk.Tk):
         self._derniere_verif = 0.0
         self._plage_prec = None
         self._cache_planning = (None, None)
+        # 26/11/2026 (2) : liste blanche (demandes de connexion), invites, limites
+        self._demandes = {}          # mac -> heure de la tentative
+        self._refuses = set()        # deja refuses dans cette session (pas de nouvelle notif)
+        self._garde_en_cours = False
+        self._keyids = {}            # mac -> keyid (« invite ») lu dans hostapd
+        self._ip_limitees = {}       # mac -> ip au moment ou la limite a ete appliquee
         # Les fils d'arriere-plan (statut, pkexec, icone de la barre) ne touchent
         # jamais Tk directement : ils deposent une fonction ici, executee par Tk.
         self._file = queue.Queue()
@@ -977,6 +1097,7 @@ class OptimaApp(tk.Tk):
         self._boucle_rapide()
         self._boucle_statut()
         self.after(1500, self._boucle_qualite)
+        self.after(2000, self._boucle_garde)
 
         if mode_auto:
             if TRAY_DISPONIBLE:
@@ -1046,6 +1167,8 @@ class OptimaApp(tk.Tk):
         BoutonPilule(tete, t, "Historique", self._ouvrir_historique, taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
         BoutonPilule(tete, t, "Statistiques", self._ouvrir_stats, taille=11, hauteur=px(28),
+                     fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
+        BoutonPilule(tete, t, "Vitesse", self._ouvrir_vitesse, taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
 
         # -- carte etat
@@ -1151,6 +1274,14 @@ class OptimaApp(tk.Tk):
         self.bouton_qr = BoutonPilule(outils, t, "QR code", self._basculer_qr, taille=11, hauteur=px(28),
                                       style="bleu")
         self.bouton_qr.pack(side="right")
+        ligne_inv = tk.Frame(corps, bg=t["carte"])
+        ligne_inv.pack(fill="x", pady=px((10, 0)))
+        self.bouton_invite = BoutonPilule(ligne_inv, t, "Accès invité", self._ouvrir_invite, taille=11,
+                                          hauteur=px(28), style="bleu")
+        self.bouton_invite.pack(side="left")
+        self.label_invite = tk.Label(ligne_inv, text="", font=(POLICE, 11), bg=t["carte"],
+                                     fg=t["texte_att"], anchor="w")
+        self.label_invite.pack(side="left", padx=px((10, 0)))
         self.cadre_qr = tk.Frame(corps, bg=t["carte"])
         self.bouton_appliquer = BoutonPilule(corps, t, "Appliquer les changements (redémarre le partage)",
                                              self._on_demarrer, style="bleu", taille=11, hauteur=px(30))
@@ -1162,11 +1293,16 @@ class OptimaApp(tk.Tk):
         # -- carte appareils
         carte_a = Carte(c, t, titre="APPAREILS CONNECTÉS")
         carte_a.pack(fill="x", padx=px(16), pady=px((0, 12)))
+        self.carte_appareils = carte_a
         self.cadre_appareils = carte_a.corps
         self.label_aucun = tk.Label(self.cadre_appareils, text="Aucun appareil connecté.",
                                     font=(POLICE, 12), bg=t["carte"], fg=t["texte_att"], anchor="w")
         self.label_aucun.pack(fill="x")
         self.lignes_appareils = {}
+
+        # -- demandes de connexion (liste blanche), affichee seulement si besoin
+        self.carte_demandes = Carte(c, t, titre="DEMANDES DE CONNEXION")
+        self.lignes_demandes = {}
 
         # -- carte bloques (affichee seulement si besoin)
         self.carte_bloques = Carte(c, t, titre="APPAREILS BLOQUÉS")
@@ -1306,6 +1442,8 @@ class OptimaApp(tk.Tk):
 
     def _afficher_appareils(self, appareils):
         t = self.t
+        if self.config_actuelle.get("liste_blanche"):
+            appareils = [a for a in appareils if a.get("mac") not in self._demandes]
         macs = [a["mac"] for a in appareils if a.get("mac")]
         for mac in list(self.lignes_appareils):
             if mac not in macs:
@@ -1326,6 +1464,9 @@ class OptimaApp(tk.Tk):
             st = self.stations.get(mac, {})
             ligne["nom"].config(text=self._nom_appareil(app))
             details = [app.get("ip", "")]
+            limite = self.config_actuelle["limites_debit"].get(mac)
+            if limite:
+                details.append(f"max {format_kbit(limite)}")
             if st.get("connected_time"):
                 details.append(f"connecté depuis {format_duree(int(st['connected_time']))}")
             ligne["details"].config(text="  ·  ".join(d for d in details if d))
@@ -1342,8 +1483,9 @@ class OptimaApp(tk.Tk):
                 conso += f"   ·   aujourd'hui {format_octets(du_jour)}"
             ligne["conso"].config(text=conso,
                                   fg=t["orange"] if limite and du_jour >= 0.8 * limite else t["texte_att"])
-            ligne["etat"].config(text="Internet coupé" if coupe else "",
-                                 fg=t["orange"])
+            invite = self._keyids.get(mac) == "invite"
+            ligne["etat"].config(text="Internet coupé" if coupe else ("Invité" if invite else ""),
+                                 fg=t["orange"] if coupe else t["bleu"])
             ligne["bouton_couper"].configurer(texte="Rétablir Internet" if coupe else "Couper Internet",
                                               style="bleu" if coupe else "secondaire")
             ligne["coupe"] = coupe
@@ -1376,11 +1518,13 @@ class OptimaApp(tk.Tk):
             lambda: self._action_appareil("restore" if ligne["coupe"] else "cut", mac),
             taille=11, hauteur=px(26))
         ligne["bouton_couper"].pack(side="left")
-        BoutonPilule(boutons, t, "Déconnecter et bloquer",
+        BoutonPilule(boutons, t, "Bloquer",
                      lambda: self._action_appareil("kick", mac), style="danger",
                      taille=11, hauteur=px(26)).pack(side="left", padx=px(6))
         BoutonPilule(boutons, t, "Renommer", lambda: self._renommer(mac),
                      taille=11, hauteur=px(26)).pack(side="left")
+        BoutonPilule(boutons, t, "Débit", lambda: self._choisir_debit(mac),
+                     taille=11, hauteur=px(26)).pack(side="left", padx=px((6, 0)))
         tk.Frame(cadre, bg=t["bordure"], height=max(1, px(1))).pack(fill="x", pady=px((10, 0)))
         return ligne
 
@@ -1571,7 +1715,8 @@ class OptimaApp(tk.Tk):
         c = self.config_actuelle
         return ("start", ssid, mdp, str(c.get("max_clients", 20)), str(c.get("bandwidth_mbps", 0)),
                 "1" if c.get("reseau_masque") else "0", "1" if c.get("isoler_appareils") else "0",
-                c.get("dns", "auto") if c.get("dns") in ("auto", "cloudflare", "google", "quad9") else "auto")
+                c.get("dns", "auto") if c.get("dns") in ("auto", "cloudflare", "google", "quad9") else "auto",
+                ",".join(f"{m}={k}" for m, k in c.get("limites_debit", {}).items() if int(k) > 0))
 
     def _on_arreter(self, auto=False, raison=None):
         self.arret_programme = None
@@ -1705,6 +1850,9 @@ class OptimaApp(tk.Tk):
         def tache():
             etat = lire_statut()
             stations = lire_stations() if etat.get("running") else {}
+            for mac, st in stations.items():
+                if st.get("keyid"):
+                    self._keyids[mac] = st["keyid"]
             source = nom_reseau_source(etat.get("uplink")) if etat.get("uplink") not in (None, "null") else None
             # Theme "Auto" : suit en direct le mode clair/sombre de GNOME
             mode = theme_systeme() if self.config_actuelle.get("theme", "auto") not in THEMES else None
@@ -1747,6 +1895,9 @@ class OptimaApp(tk.Tk):
         self._afficher_appareils(appareils)
         if actif:
             self._verifier_quotas_appareils(appareils)
+            self._suivre_invite(stations)
+            self._suivre_limites(appareils)
+        self._maj_label_invite()
         self._afficher_bloques([m.lower() for m in etat.get("blocked") or []])
         self._maj_bouton_appliquer()
         if TRAY_DISPONIBLE and self.icone_tray and time.time() - getattr(self, "_tray_maj", 0) > 30:
@@ -2007,6 +2158,513 @@ class OptimaApp(tk.Tk):
         except FileNotFoundError:
             self._message("Ouvre un navigateur sur http://neverssl.com pour te reconnecter.", "orange")
 
+    # -- liste blanche : demandes de connexion (26/11/2026) ---------------------------------
+    def _boucle_garde(self):
+        """Toutes les 1,5 s si la liste blanche est active : un appareil inconnu qui
+        s'associe est aussitot refuse (deny_acl + deauth, sans root) et apparait dans
+        « Demandes de connexion »."""
+        try:
+            if (self.config_actuelle.get("liste_blanche") and self.etat.get("running")
+                    and not self._garde_en_cours):
+                self._garde_en_cours = True
+                autorises = {m.lower() for m in self.config_actuelle.get("appareils_autorises", [])}
+
+                def tache():
+                    refuses = []
+                    for mac in lister_stations_rapide() or []:
+                        if mac in autorises:
+                            continue
+                        if keyid_station(mac) == "invite":
+                            self._keyids[mac] = "invite"
+                            continue
+                        hostapd_cmd("deny_acl", "ADD_MAC", mac)
+                        hostapd_cmd("deauthenticate", mac)
+                        refuses.append(mac)
+                    self._en_main(lambda: self._apres_garde(refuses))
+
+                threading.Thread(target=tache, daemon=True).start()
+            self.after(1500, self._boucle_garde)
+        except tk.TclError:
+            pass
+
+    def _apres_garde(self, refuses):
+        self._garde_en_cours = False
+        for mac in refuses:
+            nouveau = mac not in self._demandes
+            self._demandes[mac] = time.time()
+            if nouveau and mac not in self._refuses:
+                self._refuses.add(mac)
+                nom = self._nom_appareil({"mac": mac})
+                ajouter_historique({"heure": datetime.now().strftime("%d/%m %H:%M:%S"),
+                                    "evenement": "refuse", "hostname": nom, "ip": "", "mac": mac})
+                envoyer_notification("Optima — appareil refusé",
+                                     f"{nom} a essayé de se connecter. Ouvre Optima pour l'autoriser.")
+        if refuses:
+            self._afficher_demandes()
+
+    def _afficher_demandes(self):
+        t = self.t
+        for mac in list(self.lignes_demandes):
+            if mac not in self._demandes:
+                self.lignes_demandes.pop(mac).destroy()
+        for mac, quand in sorted(self._demandes.items(), key=lambda e: -e[1]):
+            if mac in self.lignes_demandes:
+                continue
+            ligne = tk.Frame(self.carte_demandes.corps, bg=t["carte"])
+            ligne.pack(fill="x", pady=px(4))
+            bloc = tk.Frame(ligne, bg=t["carte"])
+            bloc.pack(side="left", fill="x", expand=True)
+            nom = self._nom_appareil({"mac": mac})
+            tk.Label(bloc, text=nom, font=(POLICE, 12, "bold"), bg=t["carte"], fg=t["texte"],
+                     anchor="w").pack(fill="x")
+            tk.Label(bloc, text=f"{mac}  ·  refusé à {datetime.fromtimestamp(quand):%H:%M}",
+                     font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"], anchor="w").pack(fill="x")
+            BoutonPilule(ligne, t, "Ignorer", lambda m=mac: self._ignorer_demande(m), taille=11,
+                         hauteur=px(28)).pack(side="right")
+            BoutonPilule(ligne, t, "Autoriser", lambda m=mac: self._autoriser(m), style="principal",
+                         taille=11, hauteur=px(28)).pack(side="right", padx=px((0, 6)))
+            self.lignes_demandes[mac] = ligne
+        if self._demandes and not self.carte_demandes.winfo_ismapped():
+            self.carte_demandes.pack(fill="x", padx=px(16), pady=px((0, 12)), before=self.carte_appareils)
+        elif not self._demandes and self.carte_demandes.winfo_ismapped():
+            self.carte_demandes.pack_forget()
+
+    def _autoriser(self, mac):
+        liste = self.config_actuelle.setdefault("appareils_autorises", [])
+        if mac not in liste:
+            liste.append(mac)
+        sauvegarder_config(self.config_actuelle)
+        self._demandes.pop(mac, None)
+        self._refuses.discard(mac)
+        threading.Thread(target=lambda: hostapd_cmd("deny_acl", "DEL_MAC", mac), daemon=True).start()
+        self._afficher_demandes()
+        self._message(f"✓ {self._nom_appareil({'mac': mac})} est autorisé : il peut se reconnecter "
+                      "(reconnecte-le à la main s'il ne le fait pas tout seul).", "accent")
+
+    def _ignorer_demande(self, mac):
+        # reste refuse (deny_acl) mais disparait de la liste
+        self._demandes.pop(mac, None)
+        self._afficher_demandes()
+
+    def _activer_liste_blanche(self):
+        """A l'activation : les appareils deja connectes et ceux qui ont un surnom sont autorises."""
+        c = self.config_actuelle
+        liste = c.setdefault("appareils_autorises", [])
+        for mac in [a.get("mac") for a in self.etat.get("devices") or []] + list(c["surnoms"]):
+            if mac and mac not in liste:
+                liste.append(mac)
+
+    def _gerer_autorises(self, parent):
+        t = self.t
+        fen = tk.Toplevel(parent, bg=t["fond"])
+        fen.title("Appareils autorisés")
+        fen.transient(parent)
+        tk.Label(fen, text="Appareils autorisés", font=(POLICE, 15, "bold"), bg=t["fond"],
+                 fg=t["texte"]).pack(anchor="w", padx=px(20), pady=px((18, 4)))
+        tk.Label(fen, text="Quand la liste est active, les autres appareils sont refusés et "
+                           "apparaissent dans « Demandes de connexion ».",
+                 font=(POLICE, 11), bg=t["fond"], fg=t["texte_att"], wraplength=px(400),
+                 justify="left").pack(anchor="w", padx=px(20))
+        carte = Carte(fen, t)
+        carte.pack(fill="both", padx=px(16), pady=px((10, 16)))
+
+        def remplir():
+            for e in carte.corps.winfo_children():
+                e.destroy()
+            liste = self.config_actuelle.get("appareils_autorises", [])
+            if not liste:
+                tk.Label(carte.corps, text="Aucun appareil pour l'instant.", font=(POLICE, 12),
+                         bg=t["carte"], fg=t["texte_att"]).pack(anchor="w")
+            for mac in liste:
+                l = tk.Frame(carte.corps, bg=t["carte"])
+                l.pack(fill="x", pady=px(3))
+                tk.Label(l, text=self._nom_appareil({"mac": mac}), font=(POLICE, 12), bg=t["carte"],
+                         fg=t["texte"], anchor="w").pack(side="left")
+                BoutonPilule(l, t, "Retirer", lambda m=mac: retirer(m), style="danger", taille=11,
+                             hauteur=px(26)).pack(side="right")
+
+        def retirer(mac):
+            self.config_actuelle["appareils_autorises"].remove(mac)
+            sauvegarder_config(self.config_actuelle)
+            remplir()
+
+        remplir()
+        fen.update_idletasks()
+        taille = f"{px(460)}x{min(px(600), fen.winfo_reqheight() + px(20))}"
+        fen.geometry(taille)
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
+
+    # -- acces invite (26/11/2026) -------------------------------------------------------
+    def _invite_active(self):
+        inv = self.config_actuelle.get("invite")
+        return inv if inv and inv.get("expire", 0) > time.time() else None
+
+    def _maj_label_invite(self):
+        inv = self._invite_active()
+        if inv:
+            n = len(inv.get("macs", []))
+            texte = f"Actif · expire dans {format_duree(inv['expire'] - time.time())}"
+            if n:
+                texte += f" · {n} invité{'s' if n > 1 else ''}"
+            self.label_invite.config(text=texte, fg=self.t["bleu"])
+        else:
+            self.label_invite.config(text="Mot de passe temporaire pour tes visiteurs.",
+                                     fg=self.t["texte_att"])
+
+    def _suivre_invite(self, stations):
+        inv = self.config_actuelle.get("invite")
+        if not inv:
+            return
+        if inv.get("expire", 0) <= time.time():
+            self._revoquer_invite(raison="expire")
+            return
+        for mac, st in stations.items():
+            if st.get("keyid") == "invite" and mac not in inv.setdefault("macs", []):
+                inv["macs"].append(mac)
+                sauvegarder_config(self.config_actuelle)
+        if invites_disponibles():
+            threading.Thread(target=lambda: ecrire_invites(inv["mdp"]), daemon=True).start()
+
+    def _creer_invite(self, heures):
+        if not invites_disponibles():
+            return False
+        inv = self._invite_active()
+        mdp = inv["mdp"] if inv else generer_mdp_invite()
+        if not ecrire_invites(mdp):
+            return False
+        maintenant = time.time()
+        self.config_actuelle["invite"] = {
+            "mdp": mdp, "debut": inv["debut"] if inv else maintenant,
+            "expire": (inv["expire"] if inv else maintenant) + heures * 3600,
+            "macs": inv.get("macs", []) if inv else []}
+        sauvegarder_config(self.config_actuelle)
+        self._maj_label_invite()
+        return True
+
+    def _revoquer_invite(self, raison="manuel"):
+        inv = self.config_actuelle.get("invite") or {}
+        macs = set(inv.get("macs", [])) | {m for m, k in self._keyids.items() if k == "invite"}
+        self.config_actuelle["invite"] = None
+        sauvegarder_config(self.config_actuelle)
+
+        def tache():
+            ecrire_invites(None)
+            for mac in macs:
+                hostapd_cmd("deauthenticate", mac)
+
+        threading.Thread(target=tache, daemon=True).start()
+        self._maj_label_invite()
+        texte = "Accès invité expiré" if raison == "expire" else "Accès invité révoqué"
+        if macs:
+            texte += f" : {len(macs)} invité{'s' if len(macs) > 1 else ''} déconnecté{'s' if len(macs) > 1 else ''}"
+        self._message(f"✓ {texte}.", "accent")
+        if raison == "expire":
+            envoyer_notification("Optima", texte + ".")
+
+    def _ouvrir_invite(self):
+        t = self.t
+        ancienne = getattr(self, "_fen_invite", None)
+        if ancienne is not None and ancienne.winfo_exists():
+            _premier_plan(ancienne)
+            return
+        fen = tk.Toplevel(self, bg=t["fond"])
+        self._fen_invite = fen
+        fen.title("Accès invité")
+        fen.transient(self)
+        corps = tk.Frame(fen, bg=t["fond"])
+        corps.pack(fill="both", expand=True)
+
+        def construire():
+            for e in corps.winfo_children():
+                e.destroy()
+            tk.Label(corps, text="Accès invité", font=(POLICE, 16, "bold"), bg=t["fond"],
+                     fg=t["texte"]).pack(anchor="w", padx=px(20), pady=px((18, 4)))
+            tk.Label(corps, text="Un second mot de passe pour le même réseau, qui s'arrête tout seul. "
+                                 "À la fin, les invités sont déconnectés ; ton mot de passe ne change pas.",
+                     font=(POLICE, 11), bg=t["fond"], fg=t["texte_att"], wraplength=px(420),
+                     justify="left").pack(anchor="w", padx=px(20))
+            carte = Carte(corps, t)
+            carte.pack(fill="x", padx=px(16), pady=px((12, 16)))
+            c = carte.corps
+            inv = self._invite_active()
+            if not self.etat.get("running"):
+                tk.Label(c, text="Démarre d'abord le partage.", font=(POLICE, 12), bg=t["carte"],
+                         fg=t["texte_att"]).pack(anchor="w")
+                return
+            if not invites_disponibles():
+                tk.Label(c, text="Disponible au prochain démarrage du partage", font=(POLICE, 12, "bold"),
+                         bg=t["carte"], fg=t["texte"], anchor="w").pack(fill="x")
+                tk.Label(c, text="Le partage en cours a été lancé avant cette nouveauté. Arrête-le puis "
+                                 "relance-le quand ça t'arrange : l'accès invité sera prêt.",
+                         font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"], wraplength=px(400),
+                         justify="left", anchor="w").pack(fill="x", pady=px((4, 0)))
+                return
+            if not inv:
+                tk.Label(c, text="Durée", font=(POLICE, 12), bg=t["carte"], fg=t["texte"]).pack(anchor="w")
+                rangee = tk.Frame(c, bg=t["carte"])
+                rangee.pack(fill="x", pady=px((8, 0)))
+                for h, lib in ((1, "1 heure"), (3, "3 heures"), (24, "24 heures")):
+                    BoutonPilule(rangee, t, lib, lambda h=h: creer(h), style="bleu", taille=11,
+                                 hauteur=px(32)).pack(side="left", padx=px((0, 6)))
+                return
+            tk.Label(c, text="Réseau", font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"]).pack(anchor="w")
+            tk.Label(c, text=lire_ssid_en_service() or self.config_actuelle["ssid"], font=(POLICE, 13),
+                     bg=t["carte"], fg=t["texte"]).pack(anchor="w")
+            tk.Label(c, text="Mot de passe invité", font=(POLICE, 10), bg=t["carte"],
+                     fg=t["texte_att"]).pack(anchor="w", pady=px((8, 0)))
+            tk.Label(c, text=inv["mdp"], font=("Monospace", 16, "bold"), bg=t["carte"],
+                     fg=t["bleu"]).pack(anchor="w")
+            label_exp = tk.Label(c, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"])
+            label_exp.pack(anchor="w", pady=px((4, 0)))
+
+            def tic():
+                if not label_exp.winfo_exists():
+                    return
+                i = self._invite_active()
+                if not i:
+                    construire()
+                    return
+                fin = datetime.fromtimestamp(i["expire"])
+                n = len(i.get("macs", []))
+                label_exp.config(text=f"Expire à {fin:%H:%M} (dans {format_duree(i['expire'] - time.time())})"
+                                      f"  ·  {n} invité{'s' if n > 1 else ''} connecté{'s' if n > 1 else ''}")
+                label_exp.after(1000, tic)
+
+            tic()
+            if QR_DISPONIBLE:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                chemin = CACHE_DIR / "qr-invite.png"
+                ssid = lire_ssid_en_service() or self.config_actuelle["ssid"]
+                qrcode.make(f"WIFI:T:WPA;S:{echapper_wifi(ssid)};P:{echapper_wifi(inv['mdp'])};;",
+                            box_size=5, border=2).convert("RGB").save(chemin)
+                image = tk.PhotoImage(file=str(chemin))
+                lab = tk.Label(c, image=image, bg=t["carte"])
+                lab.image = image
+                lab.pack(pady=px((10, 0)))
+            bas = tk.Frame(c, bg=t["carte"])
+            bas.pack(fill="x", pady=px((12, 0)))
+            BoutonPilule(bas, t, "Copier", lambda: (self.clipboard_clear(), self.clipboard_append(inv["mdp"])),
+                         taille=11, hauteur=px(30)).pack(side="left")
+            BoutonPilule(bas, t, "+1 heure", lambda: creer(1), taille=11,
+                         hauteur=px(30)).pack(side="left", padx=px(6))
+            BoutonPilule(bas, t, "Révoquer maintenant", revoquer, style="danger", taille=11,
+                         hauteur=px(30)).pack(side="right")
+
+        def creer(h):
+            if not self._creer_invite(h):
+                self._message("⚠ Impossible de créer l'accès invité (relance le partage).", "rouge")
+            construire()
+            dimensionner()
+
+        def revoquer():
+            if self._demander("Révoquer l'accès invité ?", "Les invités connectés seront déconnectés "
+                              "tout de suite.", oui="Révoquer", style_oui="danger", parent=fen):
+                self._revoquer_invite()
+                construire()
+                dimensionner()
+
+        def dimensionner():
+            fen.update_idletasks()
+            taille = f"{px(480)}x{corps.winfo_reqheight()}"
+            fen.geometry(taille)
+            return taille
+
+        construire()
+        taille = dimensionner()
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
+
+    # -- debit par appareil (26/11/2026) -------------------------------------------------
+    def _choisir_debit(self, mac):
+        t = self.t
+        app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {"mac": mac})
+        nom = self._nom_appareil(app)
+        actuel = int(self.config_actuelle["limites_debit"].get(mac, 0))
+        fen = tk.Toplevel(self, bg=t["fond"])
+        fen.title("Débit maximum")
+        fen.transient(self)
+        fen.resizable(False, False)
+        tk.Label(fen, text=f"Débit maximum pour « {nom} »", font=(POLICE, 14, "bold"), bg=t["fond"],
+                 fg=t["texte"], wraplength=px(400), justify="left").pack(anchor="w", padx=px(22), pady=px((20, 4)))
+        tk.Label(fen, text="S'applique tout de suite, dans les deux sens, sans déconnecter l'appareil. "
+                           "Ton mot de passe est demandé.", font=(POLICE, 11), bg=t["fond"],
+                 fg=t["texte_att"], wraplength=px(400), justify="left").pack(anchor="w", padx=px(22))
+        rangee = tk.Frame(fen, bg=t["fond"])
+        rangee.pack(fill="x", padx=px(22), pady=px((14, 22)))
+
+        def choisir(kbit):
+            fen.destroy()
+            if kbit == actuel:
+                return
+            self._appliquer_debit(mac, kbit, nom)
+
+        for kbit in DEBITS_APPAREIL:
+            lib = "Illimité" if kbit == 0 else f"{kbit // 1000} Mbit/s"
+            BoutonPilule(rangee, t, lib, lambda k=kbit: choisir(k), taille=11, hauteur=px(32),
+                         style="bleu" if kbit == actuel else "secondaire",
+                         fond_parent=t["fond"]).pack(side="left", padx=px((0, 6)))
+        fen.update_idletasks()
+        taille = f"{max(px(460), fen.winfo_reqwidth())}x{fen.winfo_reqheight()}"
+        fen.geometry(taille)
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
+
+    def _appliquer_debit(self, mac, kbit, nom, silencieux=False):
+        app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {})
+
+        def action():
+            ok, sortie = executer_privilegie("limit", mac, str(kbit))
+            if ok:
+                limites = self.config_actuelle["limites_debit"]
+                if kbit:
+                    limites[mac] = kbit
+                else:
+                    limites.pop(mac, None)
+                sauvegarder_config(self.config_actuelle)
+            return ok, sortie
+
+        self._ip_limitees[mac] = app.get("ip")
+        succes = (f"Débit de {nom} limité à {format_kbit(kbit)}." if kbit
+                  else f"Débit de {nom} : illimité.")
+        if silencieux:
+            succes = f"Limite de débit de {nom} réappliquée (nouvelle adresse IP)."
+        self._executer(action, f"Réglage du débit de {nom}…", succes)
+
+    def _suivre_limites(self, appareils):
+        """Une limite suit l'adresse IP : si l'appareil en change, on la remet."""
+        limites = self.config_actuelle.get("limites_debit", {})
+        for app in appareils:
+            mac, ip = app.get("mac"), app.get("ip")
+            if mac not in limites or not ip:
+                continue
+            if mac not in self._ip_limitees:
+                self._ip_limitees[mac] = ip   # deja en place au lancement d'Optima
+            elif self._ip_limitees[mac] != ip and not self._occupe:
+                self._appliquer_debit(mac, int(limites[mac]), self._nom_appareil(app), silencieux=True)
+                return
+
+    # -- test de vitesse (26/11/2026) -----------------------------------------------------
+    def _ouvrir_vitesse(self):
+        t = self.t
+        ancienne = getattr(self, "_fen_vitesse", None)
+        if ancienne is not None and ancienne.winfo_exists():
+            _premier_plan(ancienne)
+            return
+        fen = tk.Toplevel(self, bg=t["fond"])
+        self._fen_vitesse = fen
+        fen.title("Test de vitesse")
+        fen.transient(self)
+        tk.Label(fen, text="Test de vitesse", font=(POLICE, 16, "bold"), bg=t["fond"],
+                 fg=t["texte"]).pack(anchor="w", padx=px(20), pady=px((18, 4)))
+        tk.Label(fen, text="Mesure la connexion source (celle que tu partages). Utilise environ "
+                           "30 Mo de données.", font=(POLICE, 11), bg=t["fond"], fg=t["texte_att"],
+                 wraplength=px(420), justify="left").pack(anchor="w", padx=px(20))
+        carte = Carte(fen, t)
+        carte.pack(fill="x", padx=px(16), pady=px((12, 12)))
+        grille = tk.Frame(carte.corps, bg=t["carte"])
+        grille.pack(fill="x")
+        valeurs = {}
+        for i, (cle, titre) in enumerate((("ping", "Ping"), ("bas", "Réception"), ("haut", "Envoi"))):
+            grille.columnconfigure(i, weight=1, uniform="v")
+            bloc = tk.Frame(grille, bg=t["carte"])
+            bloc.grid(row=0, column=i, sticky="w")
+            tk.Label(bloc, text=titre, font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"]).pack(anchor="w")
+            v = tk.Label(bloc, text="—", font=(POLICE, 17, "bold"), bg=t["carte"], fg=t["texte"])
+            v.pack(anchor="w")
+            valeurs[cle] = v
+        etat = tk.Label(carte.corps, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"],
+                        anchor="w", wraplength=px(400), justify="left")
+        etat.pack(fill="x", pady=px((10, 0)))
+        bouton = BoutonPilule(carte.corps, t, "Lancer le test", lambda: lancer(), style="principal",
+                              taille=12, hauteur=px(36))
+        bouton.pack(fill="x", pady=px((12, 0)))
+        carte_h = Carte(fen, t, titre="DERNIERS TESTS")
+        carte_h.pack(fill="x", padx=px(16), pady=px((0, 16)))
+
+        def historique():
+            for e in carte_h.corps.winfo_children()[1:]:
+                e.destroy()
+            tests = self.config_actuelle.get("tests_vitesse", [])
+            if not tests:
+                tk.Label(carte_h.corps, text="Aucun test pour l'instant.", font=(POLICE, 11),
+                         bg=t["carte"], fg=t["texte_att"]).pack(anchor="w")
+            for r in reversed(tests[-5:]):
+                tk.Label(carte_h.corps, font=(POLICE, 11), bg=t["carte"], fg=t["texte"], anchor="w",
+                         text=f"{r['date']}   ↓ {format_bits(r['bas'])}   ↑ {format_bits(r['haut'])}"
+                              f"    {r['ping']:.0f} ms").pack(fill="x")
+
+        def vivant():
+            try:
+                return fen.winfo_exists()
+            except tk.TclError:
+                return False
+
+        def maj(cle, texte, msg=None):
+            if vivant():
+                valeurs[cle].config(text=texte)
+                if msg is not None:
+                    etat.config(text=msg, fg=t["texte_att"])
+
+        def lancer():
+            if getattr(self, "_test_en_cours", False):
+                return
+            self._test_en_cours = True
+            bouton.configurer(texte="Test en cours…", actif=False)
+            for v in valeurs.values():
+                v.config(text="—")
+            uplink = self.etat.get("uplink")
+            reseau = nom_reseau_source(uplink) if uplink not in (None, "null") else None
+
+            def tache():
+                try:
+                    self._en_main(lambda: maj("ping", "…", "Mesure du ping…"))
+                    pings = [x for x in (mesurer_ping(uplink if uplink not in (None, "null") else None)
+                                         for _ in range(4)) if x is not None]
+                    if not pings:
+                        raise RuntimeError("le serveur ne répond pas")
+                    ping = sorted(pings)[len(pings) // 2]
+                    self._en_main(lambda: maj("ping", f"{ping:.0f} ms", "Test de réception…"))
+                    derniere = [0.0]
+
+                    def rappel(bits):
+                        if time.time() - derniere[0] > 0.25:
+                            derniere[0] = time.time()
+                            self._en_main(lambda b=bits: maj("bas", format_bits(b)))
+
+                    bas = test_descente(25 * MO, rappel)
+                    self._en_main(lambda: maj("bas", format_bits(bas), "Test d'envoi…"))
+                    haut = test_montee(5 * MO)
+                    self._en_main(lambda: maj("haut", format_bits(haut)))
+                    resultat = {"date": datetime.now().strftime("%d/%m %H:%M"), "ping": ping,
+                                "bas": bas, "haut": haut, "reseau": reseau}
+
+                    def fin():
+                        tests = self.config_actuelle.setdefault("tests_vitesse", [])
+                        tests.append(resultat)
+                        del tests[:-20]
+                        sauvegarder_config(self.config_actuelle)
+                        if vivant():
+                            etat.config(text="✓ Test terminé.", fg=t["accent"])
+                            historique()
+                    self._en_main(fin)
+                except Exception as erreur:
+                    texte = str(getattr(erreur, "reason", erreur))
+                    self._en_main(lambda: vivant() and etat.config(
+                        text=f"⚠ Test impossible : {texte}. Vérifie la connexion (portail captif ?).",
+                        fg=t["rouge"]))
+                finally:
+                    def liberer():
+                        self._test_en_cours = False
+                        if vivant():
+                            bouton.configurer(texte="Relancer le test", actif=True)
+                    self._en_main(liberer)
+
+            threading.Thread(target=tache, daemon=True).start()
+
+        historique()
+        fen.update_idletasks()
+        taille = f"{px(480)}x{fen.winfo_reqheight()}"
+        fen.geometry(taille)
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
+
     # -- fenetres secondaires ---------------------------------------------------------
     def _ouvrir_parametres(self):
         t = self.t
@@ -2043,6 +2701,7 @@ class OptimaApp(tk.Tk):
         var_fin = tk.StringVar(value=cfg.get("planning_fin", "23:00"))
         jours_choisis = set(cfg.get("planning_jours") or [])
         var_surveiller = tk.BooleanVar(value=cfg.get("surveiller_connexion", True))
+        var_blanche = tk.BooleanVar(value=cfg.get("liste_blanche", False))
 
         # boutons du bas fixes, le reste defile
         bas = tk.Frame(fen, bg=t["fond"])
@@ -2137,6 +2796,13 @@ class OptimaApp(tk.Tk):
                     (("auto", "Auto"), ("cloudflare", "Cloudflare"), ("google", "Google"), ("quad9", "Quad9")),
                     "Auto = celui du réseau partagé. Les autres peuvent accélérer "
                     "l'ouverture des sites ; Quad9 bloque aussi des sites malveillants.")
+        ligne_interrupteur(c, "Seulement les appareils autorisés", var_blanche,
+                           "Un appareil inconnu est refusé aussitôt et apparaît dans « Demandes de "
+                           "connexion » pour que tu l'autorises. Les appareils déjà connectés et ceux "
+                           "que tu as renommés sont autorisés d'office. Optima doit rester ouvert "
+                           "(ou réduit dans la barre).")
+        BoutonPilule(c, t, "Gérer les appareils autorisés", lambda: self._gerer_autorises(fen),
+                     taille=11, hauteur=px(28)).pack(anchor="w", pady=px((0, 6)))
         ligne_nombre(c, "Appareils maximum", var_max, 1, 50)
         ligne_nombre(c, "Limite de débit (Mbit/s)", var_debit, 0, 1000, 5, "0 = illimité")
 
@@ -2243,6 +2909,15 @@ class OptimaApp(tk.Tk):
             cfg["planning_actif"] = var_plan.get()
             cfg["quota_action"] = var_q_action.get()
             cfg["surveiller_connexion"] = var_surveiller.get()
+            if var_blanche.get() and not cfg.get("liste_blanche"):
+                self._activer_liste_blanche()
+            cfg["liste_blanche"] = var_blanche.get()
+            if not cfg["liste_blanche"] and self._demandes:
+                macs = list(self._demandes)
+                self._demandes.clear()
+                self._afficher_demandes()
+                threading.Thread(target=lambda: [hostapd_cmd("deny_acl", "DEL_MAC", m) for m in macs],
+                                 daemon=True).start()
             for cle, var, maxi in (("quota_jour_mo", var_q_jour, 100000), ("quota_mois_go", var_q_mois, 2000),
                                    ("quota_appareil_mo", var_q_app, 100000)):
                 try:
@@ -2309,7 +2984,7 @@ class OptimaApp(tk.Tk):
         for enfant in self.winfo_children():
             if not isinstance(enfant, tk.Toplevel):
                 enfant.destroy()
-        self.lignes_appareils, self.lignes_bloques = {}, {}
+        self.lignes_appareils, self.lignes_bloques, self.lignes_demandes = {}, {}, {}
         self._qr_visible = False
         self._construire()
         self.ssid_var.set(valeurs[0])
@@ -2317,6 +2992,7 @@ class OptimaApp(tk.Tk):
         if self.arret_programme:
             self._maj_texte_arret()
         self._afficher_qualite()
+        self._afficher_demandes()
         self._recuperer_statut()
 
     def _construire_panneau_admin(self, fen):
@@ -2554,6 +3230,7 @@ class OptimaApp(tk.Tk):
         zone.tag_configure("on", foreground=t["accent"])
         zone.tag_configure("off", foreground=t["texte_att"])
         zone.tag_configure("heure", foreground=t["texte_att"])
+        zone.tag_configure("refus", foreground=t["rouge"])
 
         def remplir():
             zone.config(state="normal")
@@ -2567,6 +3244,13 @@ class OptimaApp(tk.Tk):
                 if jour != jour_prec:
                     zone.insert("end", f"{jour}\n", "jour")
                     jour_prec = jour
+                if e.get("evenement") == "refuse":
+                    nom = self.config_actuelle["surnoms"].get(e.get("mac", "")) or e.get("hostname", "?")
+                    zone.insert("end", f"{heure[:5]}  ", "heure")
+                    zone.insert("end", "✕ ", "refus")
+                    zone.insert("end", f"{nom} refusé (pas dans la liste)  ")
+                    zone.insert("end", f"{e.get('mac', '')}\n", "heure")
+                    continue
                 on = e.get("evenement") == "connecte"
                 nom = self.config_actuelle["surnoms"].get(e.get("mac", "")) or e.get("hostname", "?")
                 zone.insert("end", f"{heure[:5]}  ", "heure")
@@ -2602,6 +3286,7 @@ class OptimaApp(tk.Tk):
                     pystray.MenuItem(lambda _i: f"Aujourd'hui : {format_octets(self.compteur.total_jour())}",
                                      None, enabled=False),
                     pystray.MenuItem("Statistiques", lambda *_a: self._en_main(self._ouvrir_stats)),
+                    pystray.MenuItem("Test de vitesse", lambda *_a: self._en_main(self._ouvrir_vitesse)),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem("Quitter", self._tray_quitter),
                 ),
