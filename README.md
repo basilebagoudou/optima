@@ -11,6 +11,11 @@ Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card i
   cut a device's internet access without disconnecting it, disconnect and block a device, unblock it later
 - Connection QR code shown right in the window, password generation, quick copy
 - Scheduled automatic stop (15 min to 4 h)
+- Data usage tracking per day and per device (total today / this month, kept across restarts)
+- Data limits per day, per month and per device: notification at 80 %, then either a warning or an automatic cut (stop sharing, or cut Internet for the device)
+- Sharing schedule: start and stop at fixed hours on chosen days (overnight ranges supported)
+- Source connection monitoring: live ping and packet loss, captive-portal detection with a button to open the login page, notifications when Internet drops or comes back
+- Statistics window: daily chart over 7 / 30 / 90 days, top devices, CSV export
 - Light and dark themes (follows the GNOME setting, or forced in Settings), rounded macOS-like design, HiDPI aware
 - Tray icon, system notifications (can be turned off), connection history grouped by day
 - Device count and shared bandwidth limits

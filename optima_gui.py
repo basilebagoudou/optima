@@ -22,7 +22,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from tkinter import messagebox
 
@@ -44,6 +44,7 @@ APP_DIR = Path(__file__).resolve().parent
 HOTSPOT_SCRIPT = APP_DIR / "optima-hotspot.sh"
 CONFIG_PATH = Path.home() / ".config" / "optima" / "config.json"
 HISTORY_PATH = Path.home() / ".local" / "share" / "optima" / "historique.json"
+CONSO_PATH = Path.home() / ".local" / "share" / "optima" / "conso.json"
 CACHE_DIR = Path.home() / ".cache" / "optima"
 ICONE_APP = APP_DIR / "optima-icon.png"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
@@ -122,6 +123,16 @@ CONFIG_PAR_DEFAUT = {
     "dns": "auto",                # auto | cloudflare | google | quad9
     "arret_inactif_min": 0,       # arret si aucun appareil depuis N min (0 = jamais)
     "confirmer_arret": True,      # demander avant d'arreter si des appareils sont connectes
+    # 26/11/2026 : donnees, quotas, plages horaires, surveillance de la connexion
+    "quota_jour_mo": 0,           # limite de donnees par jour, tous appareils (0 = aucune)
+    "quota_mois_go": 0,           # limite par mois civil (0 = aucune)
+    "quota_appareil_mo": 0,       # limite par appareil et par jour (0 = aucune)
+    "quota_action": "alerter",    # alerter | bloquer (arret du partage / Internet coupe pour l'appareil)
+    "planning_actif": False,      # demarrage et arret a heures fixes
+    "planning_debut": "08:00",
+    "planning_fin": "23:00",
+    "planning_jours": [0, 1, 2, 3, 4, 5, 6],   # 0 = lundi
+    "surveiller_connexion": True, # ping + detection du portail captif du reseau source
 }
 
 ERREURS_CONNUES = {
@@ -425,6 +436,239 @@ def barres_signal(dbm):
     return 1
 
 
+MO = 1024 * 1024
+GO = 1024 * MO
+JOURS_COURTS = ("L", "M", "M", "J", "V", "S", "D")
+JOURS_SEMAINE = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")
+
+
+# -- comptage des donnees (26/11/2026) -----------------------------------------------
+class Compteur:
+    """Cumule les octets partages par jour, au total (compteurs de ap0) et par
+    appareil (compteurs hostapd). Ecrit dans conso.json ; garde aussi les derniers
+    compteurs vus pour ne rien perdre si Optima est relance pendant le partage."""
+
+    GARDER_JOURS = 400
+
+    def __init__(self, chemin=CONSO_PATH):
+        self.chemin = chemin
+        self.donnees = {"jours": {}, "noms": {}, "alertes": {}, "session": {}}
+        try:
+            lu = json.loads(chemin.read_text())
+            if isinstance(lu, dict):
+                for cle in self.donnees:
+                    if isinstance(lu.get(cle), dict):
+                        self.donnees[cle] = lu[cle]
+        except (OSError, ValueError):
+            pass
+        self._modifie = False
+        self._derniere_ecriture = time.time()
+
+    # -- enregistrement
+    def _jour(self, cle=None):
+        cle = cle or date.today().isoformat()
+        return self.donnees["jours"].setdefault(cle, {"bas": 0, "haut": 0, "appareils": {}})
+
+    def ajouter_total(self, compteurs, debut):
+        """compteurs = (bas, haut) de ap0, debut = date de lancement du partage."""
+        session = self.donnees["session"]
+        if not compteurs or not debut:
+            return
+        bas, haut = compteurs
+        if session.get("debut") == debut and bas >= session.get("bas", 0) and haut >= session.get("haut", 0):
+            db, dh = bas - session.get("bas", 0), haut - session.get("haut", 0)
+        else:
+            db = dh = 0   # nouveau partage (ou premier lancement) : on part de maintenant
+            if session.get("debut") not in (None, debut):
+                session["stations"] = {}
+        session.update({"debut": debut, "bas": bas, "haut": haut})
+        if db or dh:
+            j = self._jour()
+            j["bas"] += db
+            j["haut"] += dh
+            self._modifie = True
+
+    def ajouter_stations(self, stations, appareils):
+        session = self.donnees["session"]
+        prec = session.setdefault("stations", {})
+        maintenant = time.time()
+        vu = session.get("vu")   # derniere observation (None = tout premier lancement)
+        noms = {a.get("mac"): a.get("hostname") for a in appareils or []}
+        j = None
+        for mac, st in stations.items():
+            try:
+                tx, rx = int(st.get("tx_bytes", 0)), int(st.get("rx_bytes", 0))
+                ct = int(st.get("connected_time", 0))
+            except ValueError:
+                continue
+            ancien = prec.get(mac)
+            if ancien and tx >= ancien[0] and rx >= ancien[1] and ct >= ancien[2]:
+                db, dh = tx - ancien[0], rx - ancien[1]
+            elif ancien is None and (vu is None or ct > maintenant - vu + 15):
+                db = dh = 0   # deja connecte avant qu'on observe : pas de rattrapage
+            else:
+                db, dh = tx, rx   # nouvelle association : compteurs repartis de zero
+            prec[mac] = [tx, rx, ct]
+            nom = noms.get(mac)
+            if nom and nom not in ("*", "Appareil inconnu") and self.donnees["noms"].get(mac) != nom:
+                self.donnees["noms"][mac] = nom
+                self._modifie = True
+            if db or dh:
+                j = j or self._jour()
+                a = j["appareils"].setdefault(mac, [0, 0])
+                a[0] += db
+                a[1] += dh
+                self._modifie = True
+        session["vu"] = maintenant
+        for mac in list(prec):
+            if mac not in stations:
+                prec.pop(mac)
+
+    def sauvegarder(self, forcer=False):
+        if not (self._modifie or forcer):
+            return
+        if not forcer and time.time() - self._derniere_ecriture < 30:
+            return
+        limite = (date.today() - timedelta(days=self.GARDER_JOURS)).isoformat()
+        for cle in [k for k in self.donnees["jours"] if k < limite]:
+            self.donnees["jours"].pop(cle)
+        for cle in [k for k in self.donnees["alertes"] if k.split("|")[1] < limite[:7]]:
+            self.donnees["alertes"].pop(cle)
+        try:
+            self.chemin.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.chemin.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.donnees, ensure_ascii=False))
+            tmp.replace(self.chemin)
+            self._modifie = False
+            self._derniere_ecriture = time.time()
+        except OSError:
+            pass
+
+    # -- lecture
+    def jour(self, cle=None):
+        j = self.donnees["jours"].get(cle or date.today().isoformat(), {})
+        return j.get("bas", 0), j.get("haut", 0)
+
+    def total_jour(self, cle=None):
+        return sum(self.jour(cle))
+
+    def total_mois(self, mois=None):
+        mois = mois or date.today().isoformat()[:7]
+        return sum(j.get("bas", 0) + j.get("haut", 0)
+                   for k, j in self.donnees["jours"].items() if k.startswith(mois))
+
+    def appareil_jour(self, mac, cle=None):
+        a = self.donnees["jours"].get(cle or date.today().isoformat(), {}).get("appareils", {}).get(mac)
+        return sum(a) if a else 0
+
+    def serie(self, n):
+        aujourdhui = date.today()
+        jours = [aujourdhui - timedelta(days=i) for i in range(n - 1, -1, -1)]
+        return [(d, *self.jour(d.isoformat())) for d in jours]
+
+    def total_periode(self, n):
+        return sum(b + h for _d, b, h in self.serie(n))
+
+    def classement(self, n):
+        debut = (date.today() - timedelta(days=n - 1)).isoformat()
+        cumul = {}
+        for k, j in self.donnees["jours"].items():
+            if k >= debut:
+                for mac, (b, h) in j.get("appareils", {}).items():
+                    c = cumul.setdefault(mac, [0, 0])
+                    c[0] += b
+                    c[1] += h
+        return sorted(cumul.items(), key=lambda e: -(e[1][0] + e[1][1]))
+
+    def alerte_deja(self, cle):
+        return cle in self.donnees["alertes"]
+
+    def noter_alerte(self, cle):
+        self.donnees["alertes"][cle] = True
+        self._modifie = True
+
+
+# -- qualite de la connexion source (26/11/2026) -------------------------------------
+def mesurer_ping(iface, cible="1.1.1.1"):
+    """Temps de reponse en ms via l'interface source, None si perdu."""
+    commande = ["ping", "-n", "-q", "-c", "1", "-W", "2"]
+    if iface:
+        commande += ["-I", iface]
+    try:
+        r = subprocess.run(commande + [cible], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    m = re.search(r"= [0-9.]+/([0-9.]+)/", r.stdout)
+    return float(m.group(1)) if r.returncode == 0 and m else None
+
+
+def verifier_connectivite():
+    """full | portal | limited | none | unknown (verification de NetworkManager)."""
+    try:
+        return subprocess.run(["nmcli", "networking", "connectivity", "check"],
+                              capture_output=True, text=True, timeout=20).stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+# -- plages horaires (26/11/2026) -----------------------------------------------------
+def lire_heure(texte):
+    m = re.fullmatch(r"\s*([01]?\d|2[0-3])\s*[:hH]\s*([0-5]\d)?\s*", texte or "")
+    if not m:
+        return None
+    return int(m.group(1)) * 60 + int(m.group(2) or 0)
+
+
+def dans_plage(cfg, moment=None):
+    moment = moment or datetime.now()
+    debut, fin = lire_heure(cfg.get("planning_debut")), lire_heure(cfg.get("planning_fin"))
+    jours = cfg.get("planning_jours") or []
+    if debut is None or fin is None:
+        return None
+    m, j = moment.hour * 60 + moment.minute, moment.weekday()
+    if debut == fin:
+        return j in jours
+    if debut < fin:
+        return j in jours and debut <= m < fin
+    # plage qui passe minuit (ex. 20:00 -> 02:00) : la nuit appartient au jour de depart
+    return (j in jours and m >= debut) or ((j - 1) % 7 in jours and m < fin)
+
+
+def prochain_changement(cfg, moment=None):
+    """(datetime, demarre) du prochain debut ou fin de plage, sur 8 jours."""
+    moment = (moment or datetime.now()).replace(second=0, microsecond=0)
+    etat = dans_plage(cfg, moment)
+    if etat is None:
+        return None
+    for i in range(1, 8 * 24 * 60):
+        t = moment + timedelta(minutes=i)
+        if dans_plage(cfg, t) != etat:
+            return t, not etat
+    return None
+
+
+def format_moment(t):
+    aujourdhui = date.today()
+    if t.date() == aujourdhui:
+        jour = "aujourd'hui"
+    elif t.date() == aujourdhui + timedelta(days=1):
+        jour = "demain"
+    else:
+        jour = JOURS_SEMAINE[t.weekday()]
+    return f"{jour} à {t:%H:%M}"
+
+
+def dossier_documents():
+    try:
+        d = subprocess.run(["xdg-user-dir", "DOCUMENTS"], capture_output=True, text=True,
+                           timeout=3).stdout.strip()
+        if d and Path(d).is_dir():
+            return Path(d)
+    except Exception:
+        pass
+    return Path.home()
+
+
 def image_icone_tray(actif):
     # Point rond : vert quand le partage est actif, gris quand il est arrete
     # (dessine en 4x puis reduit pour des bords lisses).
@@ -575,6 +819,31 @@ class Interrupteur(tk.Canvas):
         self.create_oval(x - px(11), px(2), x + px(11), px(24), fill="#ffffff", outline="")
 
 
+class Jauge(tk.Canvas):
+    """Barre de progression fine (quota) : verte, orange a 80 %, rouge a 100 %."""
+
+    def __init__(self, parent, t):
+        super().__init__(parent, height=px(6), bg=t["carte"], highlightthickness=0, bd=0)
+        self.t, self.ratio = t, 0.0
+        self.bind("<Configure>", lambda _e: self._dessiner())
+
+    def definir(self, ratio):
+        self.ratio = max(0.0, ratio)
+        self._dessiner()
+
+    def _dessiner(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 10:
+            return
+        rect_arrondi(self, 0, 0, w, h, h / 2, fill=self.t["bouton"], outline="")
+        couleur = (self.t["rouge"] if self.ratio >= 1 else
+                   self.t["orange"] if self.ratio >= 0.8 else self.t["accent"])
+        largeur = max(h, w * min(1.0, self.ratio)) if self.ratio > 0 else 0
+        if largeur:
+            rect_arrondi(self, 0, 0, largeur, h, h / 2, fill=couleur, outline="")
+
+
 class BoutonMarche(tk.Canvas):
     """Gros bouton rond marche/arret."""
 
@@ -687,6 +956,16 @@ class OptimaApp(tk.Tk):
         self.duree_arret = 0
         self._nom_source = None
         self._qr_visible = False
+        # 26/11/2026 : donnees, qualite de la connexion source, plages horaires
+        self.compteur = Compteur()
+        self._pings = deque(maxlen=12)       # 1 minute de mesures (une toutes les 5 s)
+        self._connectivite = None
+        self._niveau_qualite = None
+        self._texte_qualite = ""
+        self._qualite_en_cours = False
+        self._derniere_verif = 0.0
+        self._plage_prec = None
+        self._cache_planning = (None, None)
         # Les fils d'arriere-plan (statut, pkexec, icone de la barre) ne touchent
         # jamais Tk directement : ils deposent une fonction ici, executee par Tk.
         self._file = queue.Queue()
@@ -697,6 +976,7 @@ class OptimaApp(tk.Tk):
         self._configurer_tray()
         self._boucle_rapide()
         self._boucle_statut()
+        self.after(1500, self._boucle_qualite)
 
         if mode_auto:
             if TRAY_DISPONIBLE:
@@ -765,6 +1045,8 @@ class OptimaApp(tk.Tk):
                      fond_parent=t["fond"]).pack(side="right")
         BoutonPilule(tete, t, "Historique", self._ouvrir_historique, taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
+        BoutonPilule(tete, t, "Statistiques", self._ouvrir_stats, taille=11, hauteur=px(28),
+                     fond_parent=t["fond"]).pack(side="right", padx=px((0, 8)))
 
         # -- carte etat
         carte = Carte(c, t)
@@ -785,6 +1067,17 @@ class OptimaApp(tk.Tk):
         self.label_source = tk.Label(infos, text="", font=(POLICE, 11), bg=t["carte"],
                                      fg=t["texte_att"], anchor="w", justify="left", wraplength=px(350))
         self.label_source.pack(fill="x", pady=px((2, 0)))
+        ligne_q = tk.Frame(infos, bg=t["carte"])
+        ligne_q.pack(fill="x", pady=px((2, 0)))
+        self.point_qualite = tk.Label(ligne_q, text="●", font=(POLICE, 11), bg=t["carte"],
+                                      fg=t["eteint"])
+        self.point_qualite.pack(side="left", anchor="n")
+        self.label_qualite = tk.Label(ligne_q, text="Mesure de la connexion…", font=(POLICE, 11),
+                                      bg=t["carte"], fg=t["texte_att"], anchor="w", justify="left",
+                                      wraplength=px(330))
+        self.label_qualite.pack(side="left", fill="x", padx=px((4, 0)))
+        self.bouton_portail = BoutonPilule(infos, t, "Ouvrir la page de connexion", self._ouvrir_portail,
+                                           style="bleu", taille=11, hauteur=px(28))
 
         # statistiques
         stats = tk.Frame(carte.corps, bg=t["carte"])
@@ -814,6 +1107,19 @@ class OptimaApp(tk.Tk):
             tk.Label(legende, text=texte, font=(POLICE, 10), bg=t["carte"],
                      fg=t["texte_att"]).pack(side="left", padx=px((0, 12)))
 
+        # donnees consommees (jour / mois) + jauges de quota
+        self.lignes_conso = {}
+        for cle, titre in (("jour", "Données aujourd'hui"), ("mois", "Données ce mois-ci")):
+            bloc = tk.Frame(carte.corps, bg=t["carte"])
+            bloc.pack(fill="x", pady=px((10 if cle == "jour" else 6, 0)))
+            l = tk.Frame(bloc, bg=t["carte"])
+            l.pack(fill="x")
+            tk.Label(l, text=titre, font=(POLICE, 12), bg=t["carte"], fg=t["texte"]).pack(side="left")
+            valeur = tk.Label(l, text="—", font=(POLICE, 12, "bold"), bg=t["carte"], fg=t["texte"])
+            valeur.pack(side="right")
+            jauge = Jauge(bloc, t)
+            self.lignes_conso[cle] = {"valeur": valeur, "jauge": jauge}
+
         # arret programme
         ligne_arret = tk.Frame(carte.corps, bg=t["carte"])
         ligne_arret.pack(fill="x", pady=px((12, 0)))
@@ -822,6 +1128,8 @@ class OptimaApp(tk.Tk):
         self.bouton_arret_prog = BoutonPilule(ligne_arret, t, "Jamais", self._cycle_arret,
                                               taille=11, hauteur=px(28), largeur=px(130))
         self.bouton_arret_prog.pack(side="right")
+        self.label_planning = tk.Label(carte.corps, text="", font=(POLICE, 11), bg=t["carte"],
+                                       fg=t["texte_att"], anchor="w", justify="left")
 
         # -- carte reseau
         carte_r = Carte(c, t, titre="RÉSEAU PARTAGÉ")
@@ -1026,7 +1334,14 @@ class OptimaApp(tk.Tk):
                          f"↑ {format_octets(int(st.get('rx_bytes', 0)))}")
             else:
                 conso = mac
-            ligne["conso"].config(text=conso)
+            du_jour = self.compteur.appareil_jour(mac)
+            limite = int(self.config_actuelle.get("quota_appareil_mo") or 0) * MO
+            if limite:
+                conso += f"   ·   aujourd'hui {format_octets(du_jour)} / {format_octets(limite)}"
+            elif du_jour:
+                conso += f"   ·   aujourd'hui {format_octets(du_jour)}"
+            ligne["conso"].config(text=conso,
+                                  fg=t["orange"] if limite and du_jour >= 0.8 * limite else t["texte_att"])
             ligne["etat"].config(text="Internet coupé" if coupe else "",
                                  fg=t["orange"])
             ligne["bouton_couper"].configurer(texte="Rétablir Internet" if coupe else "Couper Internet",
@@ -1228,6 +1543,12 @@ class OptimaApp(tk.Tk):
                     return
             self._on_arreter()
         else:
+            depassee = self._limite_depassee()
+            if depassee and not self._demander(
+                    f"La limite {depassee} est atteinte",
+                    "Tu as demandé à Optima de couper le partage une fois la limite atteinte. "
+                    "Partager quand même ?", oui="Partager quand même"):
+                return
             self._on_demarrer()
 
     def _on_demarrer(self):
@@ -1264,6 +1585,9 @@ class OptimaApp(tk.Tk):
         ssid = self.config_actuelle.get("ssid", "").strip()
         mdp = self.config_actuelle.get("password", "")
         if not ssid or len(mdp) < 8:
+            return
+        if self._limite_depassee():
+            self._message("Démarrage automatique annulé : la limite de données est atteinte.", "orange")
             return
         args = self._args_demarrage(ssid, mdp)
 
@@ -1343,6 +1667,12 @@ class OptimaApp(tk.Tk):
                 self.graphe.ajouter(0, 0)
                 self.stat_vals["vitesse"].config(text="—")
             if compteurs:
+                self.compteur.ajouter_total(compteurs, debut_du_partage())
+            self._maj_conso()
+            self._verifier_quotas()
+            self._verifier_planning()
+            self.compteur.sauvegarder()
+            if compteurs:
                 self._compteurs_prec = (maintenant, *compteurs)
                 self.stat_vals["session"].config(
                     text=f"↓ {format_octets(compteurs[0])}\n↑ {format_octets(compteurs[1])}")
@@ -1389,6 +1719,8 @@ class OptimaApp(tk.Tk):
         t = self.t
         self.etat, self.stations = etat, stations
         actif = bool(etat.get("running"))
+        if actif and stations:
+            self.compteur.ajouter_stations(stations, etat.get("devices") or [])
         if not self._occupe:
             self.bouton_marche.definir("marche" if actif else "arret")
         appareils = etat.get("devices") or []
@@ -1413,8 +1745,16 @@ class OptimaApp(tk.Tk):
             self.stat_vals["appareils"].config(text="—")
         self._traiter_diff_appareils(appareils)
         self._afficher_appareils(appareils)
+        if actif:
+            self._verifier_quotas_appareils(appareils)
         self._afficher_bloques([m.lower() for m in etat.get("blocked") or []])
         self._maj_bouton_appliquer()
+        if TRAY_DISPONIBLE and self.icone_tray and time.time() - getattr(self, "_tray_maj", 0) > 30:
+            self._tray_maj = time.time()
+            try:
+                self.icone_tray.update_menu()   # rafraichit « Aujourd'hui : … »
+            except Exception:
+                pass
         if TRAY_DISPONIBLE and self.icone_tray and getattr(self, "_tray_actif", None) != actif:
             self._tray_actif = actif
             self.icone_tray.icon = image_icone_tray(actif)
@@ -1444,6 +1784,229 @@ class OptimaApp(tk.Tk):
             verbe = "s'est connecté" if evenement == "connecte" else "s'est déconnecté"
             envoyer_notification("Optima", f"{self._nom_appareil(appareil)} {verbe}")
 
+    # -- donnees et quotas (26/11/2026) -----------------------------------------------
+    def _maj_conso(self):
+        c = self.config_actuelle
+        for cle, total, limite in (
+                ("jour", self.compteur.total_jour(), int(c.get("quota_jour_mo") or 0) * MO),
+                ("mois", self.compteur.total_mois(), int(c.get("quota_mois_go") or 0) * GO)):
+            ligne = self.lignes_conso[cle]
+            texte = format_octets(total)
+            if limite:
+                texte += f" / {format_octets(limite)}"
+                if not ligne["jauge"].winfo_ismapped():
+                    ligne["jauge"].pack(fill="x", pady=px((4, 0)))
+                ligne["jauge"].definir(total / limite)
+            elif ligne["jauge"].winfo_ismapped():
+                ligne["jauge"].pack_forget()
+            couleur = (self.t["rouge"] if limite and total >= limite else
+                       self.t["orange"] if limite and total >= 0.8 * limite else self.t["texte"])
+            ligne["valeur"].config(text=texte, fg=couleur)
+
+    def _limite_depassee(self):
+        """Nom de la limite atteinte (« du jour », « du mois ») si le mode bloquer est actif."""
+        c = self.config_actuelle
+        if c.get("quota_action") != "bloquer":
+            return None
+        jour, mois = int(c.get("quota_jour_mo") or 0) * MO, int(c.get("quota_mois_go") or 0) * GO
+        if jour and self.compteur.total_jour() >= jour:
+            return "du jour"
+        if mois and self.compteur.total_mois() >= mois:
+            return "du mois"
+        return None
+
+    def _verifier_quotas(self):
+        c, cp = self.config_actuelle, self.compteur
+        bloquer = c.get("quota_action") == "bloquer"
+        aujourdhui = date.today().isoformat()
+        for portee, periode, limite, total, libelle in (
+                ("jour", aujourdhui, int(c.get("quota_jour_mo") or 0) * MO, cp.total_jour(), "du jour"),
+                ("mois", aujourdhui[:7], int(c.get("quota_mois_go") or 0) * GO, cp.total_mois(), "du mois")):
+            if limite <= 0:
+                continue
+            cle = f"{portee}|{periode}"
+            if total >= limite and not cp.alerte_deja(cle + "|100"):
+                if bloquer and self.etat.get("running"):
+                    if self._occupe:
+                        continue   # on reessaiera a la seconde suivante
+                    cp.noter_alerte(cle + "|80")
+                    cp.noter_alerte(cle + "|100")
+                    self._on_arreter(auto=True, raison=f"Limite {libelle} atteinte "
+                                                       f"({format_octets(limite)}) : partage arrêté.")
+                    return
+                cp.noter_alerte(cle + "|80")
+                cp.noter_alerte(cle + "|100")
+                envoyer_notification("Optima — limite atteinte",
+                                     f"Limite {libelle} atteinte : {format_octets(total)} "
+                                     f"sur {format_octets(limite)}.")
+            elif total >= 0.8 * limite and not cp.alerte_deja(cle + "|80"):
+                cp.noter_alerte(cle + "|80")
+                envoyer_notification("Optima", f"80 % de la limite {libelle} utilisés "
+                                               f"({format_octets(total)} sur {format_octets(limite)}).")
+
+    def _verifier_quotas_appareils(self, appareils):
+        c, cp = self.config_actuelle, self.compteur
+        limite = int(c.get("quota_appareil_mo") or 0) * MO
+        if limite <= 0:
+            return
+        aujourdhui = date.today().isoformat()
+        for app in appareils:
+            mac = app.get("mac")
+            if not mac or cp.appareil_jour(mac) < limite:
+                continue
+            cle = f"app|{aujourdhui}|{mac}"
+            if cp.alerte_deja(cle):
+                continue
+            nom = self._nom_appareil(app)
+            if c.get("quota_action") == "bloquer" and not app.get("coupe"):
+                if self._occupe:
+                    continue
+                cp.noter_alerte(cle)
+                self._executer(lambda m=mac: executer_privilegie("cut", m),
+                               f"{nom} a atteint sa limite : coupure d'Internet…",
+                               f"{nom} a atteint sa limite du jour ({format_octets(limite)}) : "
+                               f"Internet coupé pour cet appareil.", notifier=True)
+                return
+            cp.noter_alerte(cle)
+            envoyer_notification("Optima — limite d'un appareil",
+                                 f"{nom} a utilisé {format_octets(cp.appareil_jour(mac))} aujourd'hui "
+                                 f"(limite {format_octets(limite)}).")
+
+    # -- plages horaires (26/11/2026) ---------------------------------------------------
+    def _verifier_planning(self):
+        c = self.config_actuelle
+        if not c.get("planning_actif"):
+            self._plage_prec = None
+            if self.label_planning.winfo_ismapped():
+                self.label_planning.pack_forget()
+            return
+        dedans = dans_plage(c)
+        cle_minute = (datetime.now().strftime("%Y%m%d%H%M"), c.get("planning_debut"),
+                      c.get("planning_fin"), tuple(c.get("planning_jours") or ()))
+        if self._cache_planning[0] != cle_minute:
+            self._cache_planning = (cle_minute, prochain_changement(c))
+            prochain = self._cache_planning[1]
+            if prochain:
+                t_, demarre = prochain
+                texte = (f"Plage horaire : démarrage {format_moment(t_)}" if demarre
+                         else f"Plage horaire : arrêt {format_moment(t_)}")
+            else:
+                texte = "Plage horaire : heures ou jours à vérifier dans les réglages."
+            self.label_planning.config(text=texte)
+            if not self.label_planning.winfo_ismapped():
+                self.label_planning.pack(fill="x", pady=px((6, 0)))
+        if dedans is None:
+            return
+        if self._plage_prec is None:
+            self._plage_prec = dedans   # pas d'action a l'ouverture : seulement aux changements
+            return
+        if dedans == self._plage_prec or self._occupe:
+            return
+        self._plage_prec = dedans
+        if dedans and not self.etat.get("running"):
+            self._demarrage_auto()
+        elif not dedans and self.etat.get("running"):
+            self._on_arreter(auto=True, raison="Fin de la plage horaire : partage arrêté.")
+
+    # -- qualite de la connexion source (26/11/2026) ---------------------------------------
+    def _boucle_qualite(self):
+        try:
+            uplink = self.etat.get("uplink")
+            if not self.config_actuelle.get("surveiller_connexion", True):
+                self._pings.clear()
+                self._niveau_qualite = "off"
+                self._afficher_qualite()
+            elif uplink in (None, "", "null"):
+                self._pings.clear()
+                self._niveau_qualite = "aucune"
+                self._afficher_qualite()
+            elif not self._qualite_en_cours:
+                self._qualite_en_cours = True
+                maintenant = time.time()
+                delai = 15 if self._connectivite in ("portal", "none", "limited") else 60
+                verifier = maintenant - self._derniere_verif > delai
+
+                def tache():
+                    ms = mesurer_ping(uplink)
+                    if ms is None:
+                        ms = mesurer_ping(uplink, "8.8.8.8")
+                    conn = None
+                    if verifier or (ms is None and time.time() - self._derniere_verif > 15):
+                        self._derniere_verif = time.time()
+                        conn = verifier_connectivite()
+                    self._en_main(lambda: self._appliquer_qualite(ms, conn))
+
+                threading.Thread(target=tache, daemon=True).start()
+            self.after(5000, self._boucle_qualite)
+        except tk.TclError:
+            pass
+
+    def _appliquer_qualite(self, ms, conn):
+        self._qualite_en_cours = False
+        self._pings.append(ms)
+        if conn in ("full", "portal", "limited", "none"):
+            self._connectivite = conn
+        elif ms is not None and self._connectivite in ("none", "limited"):
+            self._connectivite = "full"
+        mesures = list(self._pings)
+        reussies = [x for x in mesures if x is not None]
+        ancien = self._niveau_qualite
+        if self._connectivite == "portal":
+            niveau, texte = "portail", "Le Wi-Fi source redemande la connexion (portail captif) : les appareils n'ont plus Internet."
+        elif len(mesures) >= 3 and all(x is None for x in mesures[-3:]):
+            niveau, texte = "coupe", "Internet ne répond plus sur le réseau source."
+        elif not reussies:
+            niveau, texte = "mesure", "Mesure de la connexion…"
+        else:
+            perte = round(100 * (len(mesures) - len(reussies)) / len(mesures))
+            moyenne = sum(reussies[-6:]) / len(reussies[-6:])
+            if moyenne < 80 and perte < 5:
+                niveau, mot = "bonne", "excellente"
+            elif moyenne < 200 and perte < 20:
+                niveau, mot = "moyenne", "correcte"
+            else:
+                niveau, mot = "faible", "faible"
+            texte = f"Connexion source {mot} · {moyenne:.0f} ms · {perte} % de perte"
+        self._niveau_qualite, self._texte_qualite = niveau, texte
+        self._afficher_qualite()
+        if self.etat.get("running") and ancien not in (None, "mesure", "off", "aucune") and niveau != ancien:
+            if niveau == "portail":
+                envoyer_notification("Optima — reconnexion nécessaire",
+                                     "Le Wi-Fi source demande de se reconnecter (portail captif) : "
+                                     "les appareils n'ont plus Internet.")
+            elif niveau == "coupe":
+                envoyer_notification("Optima — Internet coupé",
+                                     "Internet ne répond plus sur le réseau source.")
+            elif ancien in ("portail", "coupe") and niveau in ("bonne", "moyenne", "faible"):
+                envoyer_notification("Optima", "Internet est revenu sur le réseau source.")
+
+    def _afficher_qualite(self):
+        t = self.t
+        niveau = self._niveau_qualite
+        couleurs = {"bonne": t["accent"], "moyenne": t["orange"], "faible": t["rouge"],
+                    "coupe": t["rouge"], "portail": t["orange"]}
+        if niveau in ("off", "aucune"):
+            self.point_qualite.master.pack_forget()
+        else:
+            if not self.point_qualite.master.winfo_ismapped():
+                self.point_qualite.master.pack(fill="x", pady=px((2, 0)))
+            self.point_qualite.config(fg=couleurs.get(niveau, t["eteint"]))
+            self.label_qualite.config(text=self._texte_qualite or "Mesure de la connexion…",
+                                      fg=t["texte"] if niveau in ("coupe", "portail") else t["texte_att"])
+        if niveau == "portail" and not self.bouton_portail.winfo_ismapped():
+            self.bouton_portail.pack(anchor="w", pady=px((6, 0)))
+        elif niveau != "portail" and self.bouton_portail.winfo_ismapped():
+            self.bouton_portail.pack_forget()
+
+    def _ouvrir_portail(self):
+        # page en http simple : le portail captif l'intercepte et affiche sa page de connexion
+        try:
+            subprocess.Popen(["xdg-open", "http://neverssl.com"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            self._derniere_verif = 0.0   # reverifier vite apres la reconnexion
+        except FileNotFoundError:
+            self._message("Ouvre un navigateur sur http://neverssl.com pour te reconnecter.", "orange")
+
     # -- fenetres secondaires ---------------------------------------------------------
     def _ouvrir_parametres(self):
         t = self.t
@@ -1471,6 +2034,15 @@ class OptimaApp(tk.Tk):
         var_inactif = tk.StringVar(value=str(cfg.get("arret_inactif_min", 0)))
         var_confirmer = tk.BooleanVar(value=cfg.get("confirmer_arret", True))
         var_theme = tk.StringVar(value=cfg.get("theme", "auto"))
+        var_q_jour = tk.IntVar(value=int(cfg.get("quota_jour_mo") or 0))
+        var_q_mois = tk.IntVar(value=int(cfg.get("quota_mois_go") or 0))
+        var_q_app = tk.IntVar(value=int(cfg.get("quota_appareil_mo") or 0))
+        var_q_action = tk.StringVar(value=cfg.get("quota_action", "alerter"))
+        var_plan = tk.BooleanVar(value=cfg.get("planning_actif", False))
+        var_debut = tk.StringVar(value=cfg.get("planning_debut", "08:00"))
+        var_fin = tk.StringVar(value=cfg.get("planning_fin", "23:00"))
+        jours_choisis = set(cfg.get("planning_jours") or [])
+        var_surveiller = tk.BooleanVar(value=cfg.get("surveiller_connexion", True))
 
         # boutons du bas fixes, le reste defile
         bas = tk.Frame(fen, bg=t["fond"])
@@ -1568,6 +2140,61 @@ class OptimaApp(tk.Tk):
         ligne_nombre(c, "Appareils maximum", var_max, 1, 50)
         ligne_nombre(c, "Limite de débit (Mbit/s)", var_debit, 0, 1000, 5, "0 = illimité")
 
+        def ligne_heures(corps):
+            l = tk.Frame(corps, bg=t["carte"])
+            l.pack(fill="x", pady=px(6))
+            champs = {}
+            for texte, var in (("De", var_debut), ("à", var_fin)):
+                tk.Label(l, text=texte, font=(POLICE, 12), bg=t["carte"], fg=t["texte"]).pack(
+                    side="left", padx=px((0 if texte == "De" else 10, 6)))
+                e = tk.Entry(l, textvariable=var, width=6, font=(POLICE, 12), justify="center",
+                             bg=t["champ"], fg=t["texte"], insertbackground=t["texte"], relief="flat",
+                             highlightthickness=1, highlightbackground=t["bordure"],
+                             highlightcolor=t["bleu"])
+                e.pack(side="left", ipady=px(4))
+                champs[texte] = e
+            return champs
+
+        def ligne_jours(corps):
+            l = tk.Frame(corps, bg=t["carte"])
+            l.pack(fill="x", pady=px((4, 6)))
+            boutons = {}
+
+            def basculer(i):
+                jours_choisis.symmetric_difference_update({i})
+                boutons[i].configurer(style="bleu" if i in jours_choisis else "secondaire")
+
+            for i, lettre in enumerate(JOURS_COURTS):
+                b = BoutonPilule(l, t, lettre, lambda i=i: basculer(i), taille=11, hauteur=px(30),
+                                 largeur=px(36), style="bleu" if i in jours_choisis else "secondaire")
+                b.pack(side="left", padx=px((0, 5)))
+                boutons[i] = b
+
+        # -- Donnees et limites
+        c = section("DONNÉES ET LIMITES")
+        ligne_nombre(c, "Limite par jour (Mo)", var_q_jour, 0, 100000, 100,
+                     "Tous appareils confondus. 0 = aucune limite.")
+        ligne_nombre(c, "Limite par mois (Go)", var_q_mois, 0, 2000, 1,
+                     "Mois civil, remis à zéro le 1er. 0 = aucune limite.")
+        ligne_nombre(c, "Limite par appareil et par jour (Mo)", var_q_app, 0, 100000, 100,
+                     "0 = aucune limite.")
+        ligne_choix(c, "Quand une limite est atteinte", var_q_action,
+                    (("alerter", "Me prévenir"), ("bloquer", "Couper")),
+                    "Une notification arrive dès 80 %. « Couper » arrête le partage (limite du jour "
+                    "ou du mois) ou coupe Internet pour l'appareil concerné ; tu le rétablis "
+                    "avec son bouton. Ton mot de passe est demandé à ce moment-là.")
+
+        # -- Plage horaire
+        c = section("PLAGE HORAIRE")
+        ligne_interrupteur(c, "Partager seulement à certaines heures", var_plan,
+                           "Le partage démarre au début de la plage et s'arrête à la fin. "
+                           "Tu peux toujours le lancer ou l'arrêter à la main entre-temps.")
+        champs_heures = ligne_heures(c)
+        ligne_jours(c)
+        label_erreur_plan = tk.Label(c, text="", font=(POLICE, 10), bg=t["carte"], fg=t["rouge"],
+                                     anchor="w")
+        label_erreur_plan.pack(fill="x")
+
         # -- Arret
         c = section("ARRÊT ET ÉCONOMIE")
         ligne_choix(c, "Arrêter si plus aucun appareil depuis", var_inactif,
@@ -1580,6 +2207,9 @@ class OptimaApp(tk.Tk):
         c = section("NOTIFICATIONS ET APPARENCE")
         ligne_interrupteur(c, "Notifier les connexions", var_notif,
                            "Une notification quand un appareil se connecte ou part.")
+        ligne_interrupteur(c, "Surveiller la connexion source", var_surveiller,
+                           "Mesure le ping toutes les 5 s et te prévient si le Wi-Fi source "
+                           "coupe Internet ou redemande la page de connexion (portail captif).")
         ligne_choix(c, "Apparence", var_theme, (("auto", "Auto"), ("clair", "Clair"), ("sombre", "Sombre")))
 
         texte_bas = "Les réglages Réseau s'appliquent au prochain démarrage du partage."
@@ -1593,7 +2223,33 @@ class OptimaApp(tk.Tk):
             self._construire_panneau_admin(contenu)
 
         def enregistrer():
+            debut, fin = lire_heure(var_debut.get()), lire_heure(var_fin.get())
+            if var_plan.get() and (debut is None or fin is None or not jours_choisis):
+                label_erreur_plan.config(
+                    text="Heures au format 08:00 et au moins un jour, s'il te plaît."
+                    if jours_choisis else "Choisis au moins un jour.")
+                champ = champs_heures["De" if debut is None else "à"]
+                champ.focus_set()
+                toile.yview_moveto(0.35)
+                return
             ancien_theme = cfg.get("theme", "auto")
+            if debut is not None:
+                cfg["planning_debut"] = f"{debut // 60:02d}:{debut % 60:02d}"
+            if fin is not None:
+                cfg["planning_fin"] = f"{fin // 60:02d}:{fin % 60:02d}"
+            cfg["planning_jours"] = sorted(jours_choisis)
+            if var_plan.get() and not cfg.get("planning_actif"):
+                self._plage_prec = None
+            cfg["planning_actif"] = var_plan.get()
+            cfg["quota_action"] = var_q_action.get()
+            cfg["surveiller_connexion"] = var_surveiller.get()
+            for cle, var, maxi in (("quota_jour_mo", var_q_jour, 100000), ("quota_mois_go", var_q_mois, 2000),
+                                   ("quota_appareil_mo", var_q_app, 100000)):
+                try:
+                    cfg[cle] = max(0, min(maxi, int(var.get())))
+                except (tk.TclError, ValueError):
+                    pass
+            self._cache_planning = (None, None)
             cfg["auto_start"] = var_auto.get()
             cfg["partage_ouverture"] = var_ouverture.get()
             cfg["fermeture"] = var_fermeture.get()
@@ -1660,6 +2316,7 @@ class OptimaApp(tk.Tk):
         self.mdp_var.set(valeurs[1])
         if self.arret_programme:
             self._maj_texte_arret()
+        self._afficher_qualite()
         self._recuperer_statut()
 
     def _construire_panneau_admin(self, fen):
@@ -1680,6 +2337,198 @@ class OptimaApp(tk.Tk):
             self.clipboard_append(var_cle.get())
 
         BoutonPilule(l, t, "Copier", copier, taille=11, hauteur=px(28)).pack(side="left", padx=px(6))
+
+    def _ouvrir_stats(self):
+        t = self.t
+        ancienne = getattr(self, "_fen_stats", None)
+        if ancienne is not None and ancienne.winfo_exists():
+            _premier_plan(ancienne)
+            return
+        self.compteur.sauvegarder(forcer=True)
+        fen = tk.Toplevel(self, bg=t["fond"])
+        self._fen_stats = fen
+        fen.title("Statistiques")
+        fen.transient(self)
+        fen.minsize(px(400), px(400))
+        toile = tk.Canvas(fen, bg=t["fond"], highlightthickness=0, bd=0)
+        toile.pack(fill="both", expand=True)
+        contenu = tk.Frame(toile, bg=t["fond"])
+        id_contenu = toile.create_window(0, 0, window=contenu, anchor="nw")
+        contenu.bind("<Configure>", lambda _e: toile.configure(scrollregion=toile.bbox("all")))
+        toile.bind("<Configure>", lambda e: toile.itemconfig(id_contenu, width=e.width))
+        fen._defilement = (toile, contenu)
+        periode = {"n": 30}
+
+        tete = tk.Frame(contenu, bg=t["fond"])
+        tete.pack(fill="x", padx=px(20), pady=px((18, 10)))
+        tk.Label(tete, text="Statistiques", font=(POLICE, 16, "bold"), bg=t["fond"],
+                 fg=t["texte"]).pack(side="left")
+        BoutonPilule(tete, t, "Exporter (CSV)", lambda: exporter(), taille=11, hauteur=px(28),
+                     fond_parent=t["fond"]).pack(side="right")
+
+        # resume
+        carte = Carte(contenu, t)
+        carte.pack(fill="x", padx=px(16), pady=px((0, 12)))
+        resume = tk.Frame(carte.corps, bg=t["carte"])
+        resume.pack(fill="x")
+        cp = self.compteur
+        for i, (titre, valeur) in enumerate((("Aujourd'hui", cp.total_jour()),
+                                              ("7 derniers jours", cp.total_periode(7)),
+                                              ("Ce mois-ci", cp.total_mois()))):
+            resume.columnconfigure(i, weight=1, uniform="r")
+            bloc = tk.Frame(resume, bg=t["carte"])
+            bloc.grid(row=0, column=i, sticky="w")
+            tk.Label(bloc, text=titre, font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"]).pack(anchor="w")
+            tk.Label(bloc, text=format_octets(valeur), font=(POLICE, 15, "bold"), bg=t["carte"],
+                     fg=t["texte"]).pack(anchor="w")
+
+        # graphique par jour
+        carte_g = Carte(contenu, t, titre="DONNÉES PAR JOUR")
+        carte_g.pack(fill="x", padx=px(16), pady=px((0, 12)))
+        choix = tk.Frame(carte_g.corps, bg=t["carte"])
+        choix.pack(fill="x", pady=px((0, 8)))
+        boutons_p = {}
+        info = tk.Label(carte_g.corps, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"],
+                        anchor="w")
+        info.pack(fill="x")
+        graphe = tk.Canvas(carte_g.corps, height=px(170), bg=t["carte"], highlightthickness=0, bd=0)
+        graphe.pack(fill="x", pady=px((6, 0)))
+        legende = tk.Frame(carte_g.corps, bg=t["carte"])
+        legende.pack(fill="x", pady=px((6, 0)))
+        for couleur, texte in ((t["graphe_bas"], "Reçu par les appareils"), (t["graphe_haut"], "Envoyé")):
+            pt = tk.Canvas(legende, width=px(10), height=px(10), bg=t["carte"], highlightthickness=0)
+            pt.create_oval(px(1), px(1), px(9), px(9), fill=couleur, outline="")
+            pt.pack(side="left", padx=px((0, 4)))
+            tk.Label(legende, text=texte, font=(POLICE, 10), bg=t["carte"],
+                     fg=t["texte_att"]).pack(side="left", padx=px((0, 12)))
+        zones = []
+
+        def texte_info_defaut():
+            total = cp.total_periode(periode["n"])
+            jours_actifs = sum(1 for _d, b, h in cp.serie(periode["n"]) if b + h)
+            moyenne = total / jours_actifs if jours_actifs else 0
+            return (f"Total : {format_octets(total)}   ·   moyenne par jour de partage : "
+                    f"{format_octets(moyenne)}")
+
+        def dessiner_graphe(_e=None):
+            graphe.delete("all")
+            zones.clear()
+            w, h = graphe.winfo_width(), graphe.winfo_height()
+            if w < 20:
+                return
+            serie = cp.serie(periode["n"])
+            bas_axe, haut_axe = h - px(22), px(14)
+            maxi = max([b + hh for _d, b, hh in serie] + [1])
+            n = len(serie)
+            pas = w / n
+            larg = max(px(3), min(px(28), pas * 0.62))
+            graphe.create_line(0, bas_axe, w, bas_axe, fill=t["bordure"])
+            if maxi > 1:
+                graphe.create_text(0, 0, text=f"max {format_octets(maxi)}", anchor="nw",
+                                   font=(POLICE, 9), fill=t["texte_att"])
+            for i, (d, b, hh) in enumerate(serie):
+                cx = pas * i + pas / 2
+                x1, x2 = cx - larg / 2, cx + larg / 2
+                hb = (b / maxi) * (bas_axe - haut_axe)
+                hh_ = (hh / maxi) * (bas_axe - haut_axe)
+                if b:
+                    graphe.create_rectangle(x1, bas_axe - hb, x2, bas_axe, fill=t["graphe_bas"], outline="")
+                if hh:
+                    graphe.create_rectangle(x1, bas_axe - hb - hh_, x2, bas_axe - hb,
+                                            fill=t["graphe_haut"], outline="")
+                if d == date.today():
+                    graphe.create_rectangle(x1, bas_axe + px(3), x2, bas_axe + px(5),
+                                            fill=t["bleu"], outline="")
+                if periode["n"] <= 7:
+                    etiquette = JOURS_SEMAINE[d.weekday()]
+                elif i % 5 == (n - 1) % 5:
+                    etiquette = d.strftime("%d/%m")
+                else:
+                    etiquette = None
+                if etiquette:
+                    demi = px(18)   # garder l'etiquette dans le cadre aux deux bords
+                    graphe.create_text(min(max(cx, demi), w - demi), h - px(2), text=etiquette,
+                                       anchor="s", font=(POLICE, 9), fill=t["texte_att"])
+                zones.append((pas * i, pas * (i + 1), d, b, hh))
+
+        def survol(e):
+            for x1, x2, d, b, hh in zones:
+                if x1 <= e.x < x2:
+                    info.config(text=f"{JOURS_SEMAINE[d.weekday()]} {d:%d/%m} : {format_octets(b + hh)}"
+                                     f"   (↓ {format_octets(b)}  ↑ {format_octets(hh)})", fg=t["texte"])
+                    return
+
+        graphe.bind("<Configure>", dessiner_graphe)
+        graphe.bind("<Motion>", survol)
+        graphe.bind("<Leave>", lambda _e: info.config(text=texte_info_defaut(), fg=t["texte_att"]))
+
+        # classement des appareils
+        carte_a = Carte(contenu, t, titre="APPAREILS LES PLUS GOURMANDS")
+        carte_a.pack(fill="x", padx=px(16), pady=px((0, 16)))
+        cadre_cl = tk.Frame(carte_a.corps, bg=t["carte"])
+        cadre_cl.pack(fill="x")
+
+        def nom_mac(mac):
+            return (self.config_actuelle["surnoms"].get(mac) or cp.donnees["noms"].get(mac)
+                    or self._nom_historique(mac) or mac)
+
+        def remplir_classement():
+            for e in cadre_cl.winfo_children():
+                e.destroy()
+            classement = cp.classement(periode["n"])[:8]
+            if not classement:
+                tk.Label(cadre_cl, text="Pas encore de données par appareil sur cette période.",
+                         font=(POLICE, 12), bg=t["carte"], fg=t["texte_att"], anchor="w").pack(fill="x")
+                return
+            maxi = max(b + h for _m, (b, h) in classement) or 1
+            for mac, (b, h) in classement:
+                l = tk.Frame(cadre_cl, bg=t["carte"])
+                l.pack(fill="x", pady=px((4, 4)))
+                haut = tk.Frame(l, bg=t["carte"])
+                haut.pack(fill="x")
+                tk.Label(haut, text=nom_mac(mac), font=(POLICE, 12), bg=t["carte"], fg=t["texte"],
+                         anchor="w").pack(side="left")
+                tk.Label(haut, text=format_octets(b + h), font=(POLICE, 12, "bold"), bg=t["carte"],
+                         fg=t["texte"]).pack(side="right")
+                jauge = Jauge(l, t)
+                jauge.pack(fill="x", pady=px((3, 0)))
+                jauge.ratio = (b + h) / maxi * 0.79   # toujours en vert : ce n'est pas un quota
+                jauge.definir(jauge.ratio)
+
+        def choisir(n):
+            periode["n"] = n
+            for k, b in boutons_p.items():
+                b.configurer(style="bleu" if k == n else "secondaire")
+            info.config(text=texte_info_defaut(), fg=t["texte_att"])
+            dessiner_graphe()
+            remplir_classement()
+
+        for n, lib in ((7, "7 jours"), (30, "30 jours"), (90, "90 jours")):
+            b = BoutonPilule(choix, t, lib, lambda n=n: choisir(n), taille=11, hauteur=px(28))
+            b.pack(side="left", padx=px((0, 6)))
+            boutons_p[n] = b
+
+        def exporter():
+            chemin = dossier_documents() / f"optima-donnees-{date.today().isoformat()}.csv"
+            lignes = ["date;appareil;mac;recu_octets;envoye_octets"]
+            for jour in sorted(cp.donnees["jours"]):
+                j = cp.donnees["jours"][jour]
+                lignes.append(f"{jour};TOTAL;;{j.get('bas', 0)};{j.get('haut', 0)}")
+                for mac, (b, h) in sorted(j.get("appareils", {}).items()):
+                    nom = nom_mac(mac).replace(";", ",")
+                    lignes.append(f"{jour};{nom};{mac};{b};{h}")
+            try:
+                chemin.write_text("\n".join(lignes) + "\n")
+                info.config(text=f"✓ Exporté dans {chemin}", fg=t["accent"])
+            except OSError as erreur:
+                info.config(text=f"⚠ Export impossible : {erreur}", fg=t["rouge"])
+
+        choisir(30)
+        fen.update_idletasks()
+        hauteur = min(contenu.winfo_reqheight() + px(10), px(720), fen.winfo_screenheight() - px(160))
+        taille = f"{px(520)}x{hauteur}"
+        fen.geometry(taille)
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
 
     def _ouvrir_historique(self):
         t = self.t
@@ -1750,6 +2599,9 @@ class OptimaApp(tk.Tk):
                     pystray.MenuItem("Ouvrir Optima", self._tray_ouvrir, default=True),
                     pystray.MenuItem(lambda _i: "Arrêter le partage" if self.etat.get("running")
                                      else "Démarrer le partage", self._tray_basculer),
+                    pystray.MenuItem(lambda _i: f"Aujourd'hui : {format_octets(self.compteur.total_jour())}",
+                                     None, enabled=False),
+                    pystray.MenuItem("Statistiques", lambda *_a: self._en_main(self._ouvrir_stats)),
                     pystray.Menu.SEPARATOR,
                     pystray.MenuItem("Quitter", self._tray_quitter),
                 ),
@@ -1769,6 +2621,7 @@ class OptimaApp(tk.Tk):
         self._en_main(self._quitter)
 
     def _quitter(self):
+        self.compteur.sauvegarder(forcer=True)
         if self.icone_tray:
             try:
                 self.icone_tray.stop()
