@@ -20,6 +20,17 @@ Desktop application (Linux/GNOME, Python + Tkinter) that turns your Wi-Fi card i
 - Allowed-devices mode: unknown devices are refused instantly and listed under "Connection requests" so you can allow them in one click
 - Per-device speed limit (download and upload), applied live without disconnecting the device
 - Built-in speed test of the shared connection (ping, download, upload, last results)
+- Captive portal auto-login: fills and submits the portal page (terms checkbox, voucher, username/password, MikroTik CHAP portals)
+- Failover: if Internet does not come back, switches the PC to the best other known Wi-Fi and restarts sharing
+- Wired sharing over the Ethernet port (skipped automatically when the cable leads to a router)
+- Keeps the PC awake while sharing (optionally with the lid closed)
+- Per-device options: speed limit, priority (served first when the link is saturated), scheduled pause (no Wi-Fi during set hours)
+- Per-device data limit per day, week or month
+- Site blocking by category (ads, social networks, video, games, adult) or custom list, with forced DNS
+- Optional log of the sites requested by each device (stays on the PC, 30 days)
+- Source connection quality history (ping, outages, best time of day) over 24 h / 7 days
+- Weekly PDF report (data, devices, sites, quality, speed tests)
+- Live speed and device count next to the tray icon
 - Light and dark themes (follows the GNOME setting, or forced in Settings), rounded macOS-like design, HiDPI aware
 - Tray icon, system notifications (can be turned off), connection history grouped by day
 - Device count and shared bandwidth limits
@@ -47,6 +58,15 @@ for the live dashboard. Actions that change the network (start, stop, cut, block
 password through pkexec.
 
 ## Installation
+
+**Debian/Ubuntu package (system-wide):**
+
+```bash
+bash packaging/build-deb.sh 3.0.0      # -> dist/optima_3.0.0_all.deb
+sudo apt install ./dist/optima_3.0.0_all.deb
+```
+
+**Per-user install:**
 
 ```bash
 git clone <url-of-this-repo>

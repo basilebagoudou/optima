@@ -52,6 +52,12 @@ stop_all() {
         iptables -t mangle -D POSTROUTING -o "$uplink" -j TTL --ttl-set 65 2>/dev/null || true
         iptables -t mangle -D PREROUTING -i "$uplink" -j TTL --ttl-set 65 2>/dev/null || true
     fi
+    # 26/11/2026 : filtrage DNS et partage par cable
+    regles_filtre off
+    if [ -s "$RUN_DIR/filaire" ]; then
+        regles_filaire "$(cat "$RUN_DIR/filaire")" off "$uplink" || true
+    fi
+    rm -f "$RUN_DIR/priorite"
     # Regle d'isolement (independante du lien montant), retiree dans tous les cas.
     while iptables -D FORWARD -i "$AP_IFACE" -o "$AP_IFACE" -j DROP 2>/dev/null; do :; done
     # Chaines dediees a la coupure d'acces et au comptage de consommation
@@ -74,6 +80,16 @@ start_ap() {
     local dns="${7:-auto}"
     # 26/11/2026 : limites de debit par appareil, "mac=kbit,mac=kbit" (optionnel)
     local limites="${8:-}"
+    # 26/11/2026 (3) : options "filtre=1;journal=0;priorite=MAC:KBIT;filaire=IFACE"
+    local options="${9:-}" opt filtre=0 journal=0 priorite="" filaire=""
+    for opt in $(echo "$options" | tr ';' ' '); do
+        case "$opt" in
+            filtre=1) filtre=1 ;;
+            journal=1) journal=1 ;;
+            priorite=*) priorite="${opt#priorite=}" ;;
+            filaire=*) filaire="${opt#filaire=}" ;;
+        esac
+    done
     [ "$hidden" = 1 ] || hidden=0
     [ "$isolate" = 1 ] || isolate=0
     local dns_clients
@@ -159,6 +175,10 @@ start_ap() {
         : > "$RUN_DIR/limits"
     fi
     echo "$bandwidth_mbps" > "$RUN_DIR/bandwidth"
+    rm -f "$RUN_DIR/priorite"
+    if echo "$priorite" | grep -qE '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}:[0-9]+$'; then
+        echo "${priorite%:*} ${priorite##*:}" | tr 'A-F' 'a-f' > "$RUN_DIR/priorite"
+    fi
 
     # 06/11/2026 (Optima v2) : socket de controle de hostapd lisible par le groupe de
     # l'utilisateur qui a lance Optima -> l'interface lit sans root le debit, le signal
@@ -249,6 +269,7 @@ dhcp-option=3,10.42.0.1
 dhcp-option=6,$dns_clients
 dhcp-leasefile=$RUN_DIR/dnsmasq.leases
 EOF
+    options_dns "$filtre" "$journal"
 
     dnsmasq --conf-file="$RUN_DIR/dnsmasq.conf" --pid-file="$RUN_DIR/dnsmasq.pid"
 
@@ -280,6 +301,11 @@ EOF
     # sur l'interface montante, avant la decision de routage.
     iptables -t mangle -A PREROUTING -i "$uplink" -j TTL --ttl-set 65
     iptables -t mangle -A POSTROUTING -o "$uplink" -j TTL --ttl-set 65
+
+    [ "$filtre" = 1 ] && regles_filtre on
+    if [ -n "$filaire" ]; then
+        regles_filaire "$filaire" on "$uplink" || true
+    fi
 
     # Reapplique les coupures d'acces internet deja demandees pour des
     # appareils qui se reconnectent apres un redemarrage du partage.
@@ -329,19 +355,39 @@ sync_state() {
 #  - ingress + police par IP source -> debit montant (ce que l'appareil envoie).
 # Sans aucune limite, ap0 reste sans file speciale (comme avant).
 appliquer_limites() {
-    local total mac kbit ip id n=16 ingress=false
+    local total mac kbit ip id n=16 ingress=false prio_mac="" prio_kbit=0 defaut_rate
     total=$(cat "$RUN_DIR/bandwidth" 2>/dev/null)
     case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    if [ -s "$RUN_DIR/priorite" ]; then
+        read -r prio_mac prio_kbit < "$RUN_DIR/priorite"
+        case "$prio_kbit" in ''|*[!0-9]*) prio_mac=""; prio_kbit=0 ;; esac
+    fi
     tc qdisc del dev "$AP_IFACE" root 2>/dev/null || true
     tc qdisc del dev "$AP_IFACE" ingress 2>/dev/null || true
-    if [ "$total" -eq 0 ] && [ ! -s "$RUN_DIR/limits" ]; then
+    if [ "$total" -eq 0 ] && [ ! -s "$RUN_DIR/limits" ] && [ -z "$prio_mac" ]; then
         return 0
     fi
-    [ "$total" -eq 0 ] && total=1000
+    # capacite en kbit/s : limite generale, sinon capacite mesuree (priorite), sinon 1 Gbit/s
+    local cap=1000000
+    [ "$total" -gt 0 ] && cap=$((total * 1000))
+    if [ -n "$prio_mac" ] && [ "$prio_kbit" -gt 0 ] && [ "$prio_kbit" -lt "$cap" ]; then
+        cap=$prio_kbit
+    fi
+    defaut_rate=$cap
+    [ -n "$prio_mac" ] && defaut_rate=$((cap * 30 / 100))
     tc qdisc add dev "$AP_IFACE" root handle 1: htb default 2 || return 0
-    tc class add dev "$AP_IFACE" parent 1: classid 1:1 htb rate "${total}mbit" ceil "${total}mbit"
-    tc class add dev "$AP_IFACE" parent 1:1 classid 1:2 htb rate "${total}mbit" ceil "${total}mbit"
+    tc class add dev "$AP_IFACE" parent 1: classid 1:1 htb rate "${cap}kbit" ceil "${cap}kbit" quantum 1514
+    tc class add dev "$AP_IFACE" parent 1:1 classid 1:2 htb rate "${defaut_rate}kbit" ceil "${cap}kbit" prio 1 quantum 1514
     tc qdisc add dev "$AP_IFACE" parent 1:2 fq_codel 2>/dev/null || true
+    # appareil prioritaire : 70 % garantis et servi en premier quand ca sature
+    if [ -n "$prio_mac" ]; then
+        ip=$(awk -v m="$prio_mac" 'tolower($2)==m{print $3}' "$RUN_DIR/dnsmasq.leases" 2>/dev/null | tail -1)
+        tc class add dev "$AP_IFACE" parent 1:1 classid 1:3 htb rate "$((cap * 70 / 100))kbit" ceil "${cap}kbit" prio 0 quantum 1514
+        tc qdisc add dev "$AP_IFACE" parent 1:3 fq_codel 2>/dev/null || true
+        if [ -n "$ip" ]; then
+            tc filter add dev "$AP_IFACE" parent 1: protocol ip prio 2 u32 match ip dst "$ip/32" flowid 1:3
+        fi
+    fi
     [ -s "$RUN_DIR/limits" ] || return 0
     while read -r mac kbit; do
         [ -z "$mac" ] && continue
@@ -349,7 +395,7 @@ appliquer_limites() {
         [ -z "$ip" ] && continue
         n=$((n + 1))
         id=$(printf '%x' "$n")
-        tc class add dev "$AP_IFACE" parent 1:1 classid "1:$id" htb rate "${kbit}kbit" ceil "${kbit}kbit"
+        tc class add dev "$AP_IFACE" parent 1:1 classid "1:$id" htb rate "${kbit}kbit" ceil "${kbit}kbit" prio 1 quantum 1514
         tc qdisc add dev "$AP_IFACE" parent "1:$id" fq_codel 2>/dev/null || true
         tc filter add dev "$AP_IFACE" parent 1: protocol ip prio 1 u32 match ip dst "$ip/32" flowid "1:$id"
         if [ "$ingress" = false ]; then
@@ -359,6 +405,123 @@ appliquer_limites() {
         tc filter add dev "$AP_IFACE" parent ffff: protocol ip prio 1 u32 match ip src "$ip/32" \
             police rate "${kbit}kbit" burst 64k drop flowid :1 2>/dev/null || true
     done < "$RUN_DIR/limits"
+}
+
+# priorite MAC|aucun KBIT : un appareil servi en premier (KBIT = capacite mesuree).
+priorite_mac() {
+    local mac kbit
+    mac=$(echo "${1:-}" | tr 'A-Z' 'a-z')
+    kbit="${2:-0}"
+    case "$kbit" in ''|*[!0-9]*) echo "ERREUR: debit invalide" >&2; exit 1 ;; esac
+    if [ "$mac" = aucun ]; then
+        rm -f "$RUN_DIR/priorite"
+    elif echo "$mac" | grep -qE '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; then
+        echo "$mac $kbit" > "$RUN_DIR/priorite"
+    else
+        echo "ERREUR: adresse MAC invalide" >&2
+        exit 1
+    fi
+    [ -f "$RUN_DIR/bandwidth" ] || echo 0 > "$RUN_DIR/bandwidth"
+    appliquer_limites || true
+    echo "OK"
+}
+
+# 26/11/2026 : filtrage des sites et journal DNS.
+#  - liste des domaines : ~/.config/optima/filtre.txt de l'utilisateur qui a lance Optima,
+#    recopiee ici apres verification (un domaine par ligne, rien d'autre) ;
+#  - dnsmasq repond « inexistant » pour ces domaines (servers-file, relu par SIGHUP) ;
+#  - les appareils sont obliges de passer par ce DNS (redirection du port 53, DNS chiffre
+#    sur le port 853 refuse) ;
+#  - journal : log-queries dans /run/optima/dns.log, lisible par le groupe de l'utilisateur.
+dossier_utilisateur() {
+    local uid="${PKEXEC_UID:-${SUDO_UID:-}}"
+    [ -n "$uid" ] && getent passwd "$uid" | cut -d: -f6
+}
+
+options_dns() {
+    local filtre="$1" journal="$2" maison groupe=0
+    maison=$(dossier_utilisateur)
+    [ -n "${PKEXEC_UID:-}" ] && groupe=$(id -g "$PKEXEC_UID" 2>/dev/null || echo 0)
+    : > "$RUN_DIR/filtre.servers"
+    if [ "$filtre" = 1 ] && [ -n "$maison" ] && [ -f "$maison/.config/optima/filtre.txt" ]; then
+        grep -E '^[a-z0-9-]+(\.[a-z0-9-]+)+$' "$maison/.config/optima/filtre.txt" | head -5000 \
+            | sed 's|.*|server=/&/|' > "$RUN_DIR/filtre.servers"
+    fi
+    sed -i '/^servers-file=/d;/^log-queries/d;/^log-facility=/d' "$RUN_DIR/dnsmasq.conf"
+    echo "servers-file=$RUN_DIR/filtre.servers" >> "$RUN_DIR/dnsmasq.conf"
+    if [ "$journal" = 1 ]; then
+        [ -f "$RUN_DIR/dns.log" ] || : > "$RUN_DIR/dns.log"
+        chown nobody:"$groupe" "$RUN_DIR/dns.log" 2>/dev/null || true
+        chmod 660 "$RUN_DIR/dns.log"
+        printf 'log-queries\nlog-facility=%s\n' "$RUN_DIR/dns.log" >> "$RUN_DIR/dnsmasq.conf"
+    else
+        rm -f "$RUN_DIR/dns.log"
+    fi
+}
+
+regles_filtre() {
+    local proto
+    for proto in udp tcp; do
+        while iptables -t nat -D PREROUTING -i "$AP_IFACE" -p "$proto" --dport 53 -m comment --comment optima-filtre -j DNAT --to-destination 10.42.0.1:53 2>/dev/null; do :; done
+    done
+    while iptables -D FORWARD -i "$AP_IFACE" -p tcp --dport 853 -m comment --comment optima-filtre -j REJECT 2>/dev/null; do :; done
+    [ "$1" = on ] || return 0
+    for proto in udp tcp; do
+        iptables -t nat -I PREROUTING -i "$AP_IFACE" -p "$proto" --dport 53 -m comment --comment optima-filtre -j DNAT --to-destination 10.42.0.1:53
+    done
+    iptables -I FORWARD -i "$AP_IFACE" -p tcp --dport 853 -m comment --comment optima-filtre -j REJECT
+}
+
+# dns FILTRE JOURNAL : applique a chaud (relance seulement dnsmasq, le Wi-Fi reste connecte).
+dns_action() {
+    local filtre="${1:-0}" journal="${2:-0}" avant pid
+    [ "$filtre" = 1 ] || filtre=0
+    [ "$journal" = 1 ] || journal=0
+    if [ ! -f "$RUN_DIR/dnsmasq.conf" ] || [ ! -f "$RUN_DIR/dnsmasq.pid" ]; then
+        echo "ERREUR: le partage n'est pas actif" >&2
+        exit 1
+    fi
+    avant=$(grep -E '^(servers-file|log-queries|log-facility)' "$RUN_DIR/dnsmasq.conf" | sort)
+    options_dns "$filtre" "$journal"
+    pid=$(cat "$RUN_DIR/dnsmasq.pid" 2>/dev/null)
+    if [ "$avant" = "$(grep -E '^(servers-file|log-queries|log-facility)' "$RUN_DIR/dnsmasq.conf" | sort)" ] \
+            && [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        kill -HUP "$pid"
+    else
+        [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            [ -n "$pid" ] && [ -d "/proc/$pid" ] || break
+            sleep 0.2
+        done
+        dnsmasq --conf-file="$RUN_DIR/dnsmasq.conf" --pid-file="$RUN_DIR/dnsmasq.pid"
+    fi
+    if [ "$filtre" = 1 ]; then regles_filtre on; else regles_filtre off; fi
+    echo "OK"
+}
+
+# 26/11/2026 : partage par cable. NetworkManager s'occupe de l'adresse et du DHCP
+# (profil « Optima cable », mode partage) ; ici on autorise seulement le transit,
+# car Docker met la chaine FORWARD en refus par defaut.
+regles_filaire() {
+    local iface="$1" etat="$2" uplink="${3:-}"
+    echo "$iface" | grep -qE '^[a-zA-Z0-9_.-]{1,15}$' || { echo "ERREUR: interface invalide" >&2; return 1; }
+    [ -z "$uplink" ] && uplink=$(detect_uplink)
+    [ -z "$uplink" ] && return 0
+    while iptables -D FORWARD -i "$iface" -o "$uplink" -m comment --comment optima-cable -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D FORWARD -i "$uplink" -o "$iface" -m state --state RELATED,ESTABLISHED -m comment --comment optima-cable -j ACCEPT 2>/dev/null; do :; done
+    if [ "$etat" = on ]; then
+        [ -d "/sys/class/net/$iface" ] || { echo "ERREUR: interface $iface introuvable" >&2; return 1; }
+        iptables -A FORWARD -i "$iface" -o "$uplink" -m comment --comment optima-cable -j ACCEPT
+        iptables -A FORWARD -i "$uplink" -o "$iface" -m state --state RELATED,ESTABLISHED -m comment --comment optima-cable -j ACCEPT
+        echo "$iface" > "$RUN_DIR/filaire"
+    else
+        rm -f "$RUN_DIR/filaire"
+    fi
+}
+
+filaire_action() {
+    regles_filaire "${1:-}" "${2:-off}" || exit 1
+    echo "OK"
 }
 
 # limit MAC KBIT : fixe (KBIT > 0) ou retire (0) la limite d'un appareil, a chaud,
@@ -576,7 +739,7 @@ status() {
 }
 
 case "$1" in
-    start) start_ap "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" ;;
+    start) start_ap "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" ;;
     stop) stop_all; echo "OK" ;;
     status) status ;;
     kick) kick_mac "$2" ;;
@@ -585,5 +748,8 @@ case "$1" in
     restore) restore_internet "$2" ;;
     sync) sync_and_report ;;
     limit) limit_mac "$2" "$3" ;;
-    *) echo "Usage: $0 {start SSID PASSWORD [MAX_CLIENTS] [BANDWIDTH_MBPS]|stop|status|kick MAC|unblock MAC|cut MAC|restore MAC|sync|limit MAC KBIT}" >&2; exit 1 ;;
+    priorite) priorite_mac "$2" "$3" ;;
+    dns) dns_action "$2" "$3" ;;
+    filaire) filaire_action "$2" "$3" ;;
+    *) echo "Usage: $0 {start SSID PASSWORD [MAX_CLIENTS] [BANDWIDTH_MBPS]|stop|status|kick MAC|unblock MAC|cut MAC|restore MAC|sync|limit MAC KBIT|priorite MAC KBIT|dns FILTRE JOURNAL|filaire IFACE on/off}" >&2; exit 1 ;;
 esac

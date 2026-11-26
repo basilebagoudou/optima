@@ -7,3 +7,4 @@ build/
 *.onefile-build/
 *.tar.gz
 .DS_Store
+dist/

@@ -50,7 +50,9 @@ CACHE_DIR = Path.home() / ".cache" / "optima"
 ICONE_APP = APP_DIR / "optima-icon.png"
 AUTOSTART_DIR = Path.home() / ".config" / "autostart"
 AUTOSTART_FILE = AUTOSTART_DIR / "optima-autostart.desktop"
-LANCEUR = Path.home() / ".local" / "bin" / "optima"
+# Installe par le paquet .deb (/usr/lib/optima) ou pour l'utilisateur (~/.local/share/optima)
+INSTALLE_SYSTEME = APP_DIR == Path("/usr/lib/optima")
+LANCEUR = Path("/usr/bin/optima") if INSTALLE_SYSTEME else Path.home() / ".local" / "bin" / "optima"
 RUN_DIR = Path("/run/optima")
 AP_IFACE = "ap0"
 
@@ -140,7 +142,31 @@ CONFIG_PAR_DEFAUT = {
     "appareils_autorises": [],
     "limites_debit": {},          # mac -> kbit/s (debit maximum par appareil)
     "tests_vitesse": [],          # derniers resultats [{"date", "ping", "bas", "haut"}]
+    # 26/11/2026 (3) : portail, secours, veille, horaires, priorite, filtrage, cable, rapport
+    "portail_auto": False,        # se reconnecter tout seul au portail captif
+    "portail_identifiant": "",
+    "portail_mdp": "",
+    "bascule_auto": False,        # passer sur un autre Wi-Fi connu si Internet ne revient pas
+    "bascule_delai_s": 90,
+    "anti_veille": "appareils",   # jamais | appareils | toujours
+    "anti_veille_capot": False,   # aussi capot ferme
+    "horaires_appareils": {},     # mac -> {"debut", "fin", "jours"} : pas de Wi-Fi pendant ce creneau
+    "quota_appareil_periode": "jour",   # jour | semaine | mois
+    "appareil_prioritaire": None,
+    "debit_dans_barre": True,
+    "filtre_actif": False,
+    "filtre_categories": [],
+    "filtre_perso": "",
+    "journal_sites": False,
+    "filaire": False,
+    "rapport_hebdo": True,
+    "dernier_rapport": "",
 }
+
+# Cles gardees par « Par defaut » (donnees de l'utilisateur, pas des reglages)
+CLES_PERSONNELLES = {"ssid", "password", "surnoms", "auto_start", "invite", "appareils_autorises",
+                     "limites_debit", "tests_vitesse", "horaires_appareils", "appareil_prioritaire",
+                     "portail_identifiant", "portail_mdp", "filtre_perso", "dernier_rapport"}
 
 ERREURS_CONNUES = {
     "aucune connexion wi-fi active": (
@@ -183,7 +209,8 @@ def charger_config():
             pass
     if not isinstance(cfg.get("surnoms"), dict):
         cfg["surnoms"] = {}
-    for cle, type_ in (("limites_debit", dict), ("appareils_autorises", list), ("tests_vitesse", list)):
+    for cle, type_ in (("limites_debit", dict), ("appareils_autorises", list), ("tests_vitesse", list),
+                       ("horaires_appareils", dict), ("filtre_categories", list)):
         if not isinstance(cfg.get(cle), type_):
             cfg[cle] = type_()
     if cfg.get("invite") is not None and not isinstance(cfg.get("invite"), dict):
@@ -304,7 +331,7 @@ def echapper_wifi(valeur):
     return re.sub(r'([\\;,":])', r'\\\1', valeur)
 
 
-LANCEURS_ROOT = Path("/usr/local/libexec/optima")
+LANCEURS_ROOT = Path("/usr/libexec/optima") if INSTALLE_SYSTEME else Path("/usr/local/libexec/optima")
 
 
 def commande_privilegiee(*args):
@@ -500,6 +527,23 @@ class Compteur:
             j["haut"] += dh
             self._modifie = True
 
+    def ajouter_interface(self, cle, compteurs):
+        """Compteurs d'une autre interface partagee (cable) : comptes comme un appareil."""
+        session = self.donnees["session"]
+        prec = session.get(cle)
+        session[cle] = list(compteurs) if compteurs else None
+        if not compteurs or not prec or compteurs[0] < prec[0] or compteurs[1] < prec[1]:
+            return
+        db, dh = compteurs[0] - prec[0], compteurs[1] - prec[1]
+        if db or dh:
+            j = self._jour()
+            j["bas"] += db
+            j["haut"] += dh
+            a = j["appareils"].setdefault(cle, [0, 0])
+            a[0] += db
+            a[1] += dh
+            self._modifie = True
+
     def ajouter_stations(self, stations, appareils):
         session = self.donnees["session"]
         prec = session.setdefault("stations", {})
@@ -572,6 +616,20 @@ class Compteur:
     def appareil_jour(self, mac, cle=None):
         a = self.donnees["jours"].get(cle or date.today().isoformat(), {}).get("appareils", {}).get(mac)
         return sum(a) if a else 0
+
+    def appareil_periode(self, mac, periode="jour", jour=None):
+        jour = jour or date.today()
+        if periode == "semaine":
+            debut = jour - timedelta(days=jour.weekday())
+        elif periode == "mois":
+            debut = jour.replace(day=1)
+        else:
+            debut = jour
+        total, d = 0, debut
+        while d <= jour:
+            total += self.appareil_jour(mac, d.isoformat())
+            d += timedelta(days=1)
+        return total
 
     def serie(self, n):
         aujourdhui = date.today()
@@ -729,6 +787,8 @@ def generer_mdp_invite():
 
 
 def format_kbit(kbit):
+    if kbit >= 10000:
+        return f"{kbit / 1000:.0f} Mbit/s"
     return f"{kbit / 1000:g} Mbit/s" if kbit >= 1000 else f"{kbit} kbit/s"
 
 
@@ -770,6 +830,614 @@ def format_bits(bits_par_s):
     if bits_par_s >= 1_000_000:
         return f"{bits_par_s / 1_000_000:.1f} Mbit/s"
     return f"{bits_par_s / 1000:.0f} kbit/s"
+
+
+# -- portail captif : reconnexion automatique (26/11/2026) --------------------------------
+import hashlib as _hashlib
+import http.cookiejar
+import urllib.parse
+from html.parser import HTMLParser
+
+SONDE_PORTAIL = "http://neverssl.com/"
+
+
+class _Formulaires(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.formulaires, self._courant, self.rafraichir = [], None, None
+
+    def handle_starttag(self, balise, attributs):
+        a = {k.lower(): (v or "") for k, v in attributs}
+        if balise == "form":
+            self._courant = {"action": a.get("action", ""), "methode": a.get("method", "get").lower(),
+                             "nom": a.get("name", "") or a.get("id", ""), "champs": []}
+            self.formulaires.append(self._courant)
+        elif balise in ("input", "button") and self._courant is not None:
+            type_ = a.get("type", "submit" if balise == "button" else "text").lower()
+            self._courant["champs"].append({"nom": a.get("name", ""), "type": type_,
+                                            "valeur": a.get("value", ""), "coche": "checked" in a})
+        elif balise == "meta" and a.get("http-equiv", "").lower() == "refresh":
+            m = re.search(r"url\s*=\s*['\"]?([^'\";]+)", a.get("content", ""), re.I)
+            if m:
+                self.rafraichir = m.group(1).strip()
+
+    def handle_endtag(self, balise):
+        if balise == "form":
+            self._courant = None
+
+
+def _octal(texte):
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), texte)
+
+
+def _sonde_libre(url, page, sonde, marqueur):
+    """Vraie page de la sonde (meme adresse ET contenu attendu) : certains portails
+    detournent l'adresse de la sonde et y servent leur propre page."""
+    return (urllib.parse.urlsplit(url).netloc == urllib.parse.urlsplit(sonde).netloc
+            and marqueur.lower() in page.lower())
+
+
+def connexion_portail(identifiant="", mdp="", sonde=SONDE_PORTAIL, journal=None, marqueur="NeverSSL"):
+    """Ouvre la page du portail captif, remplit son formulaire (case a cocher, ticket,
+    identifiant / mot de passe, portails MikroTik avec mot de passe chiffre CHAP) et
+    l'envoie. Renvoie (ok, message)."""
+    def log(m):
+        if journal is not None:
+            journal.append(m)
+
+    pots = http.cookiejar.CookieJar()
+    ouvreur = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(pots))
+    ouvreur.addheaders = [("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) Optima")]
+
+    def lire(url, donnees=None):
+        with ouvreur.open(url, data=donnees, timeout=15) as r:
+            return r.geturl(), r.read(400_000).decode(r.headers.get_content_charset() or "utf-8", "replace")
+
+    try:
+        url, page = lire(sonde)
+        if _sonde_libre(url, page, sonde, marqueur):
+            return True, "Déjà connecté : pas de portail à franchir."
+        for _ in range(3):   # redirections par balise meta ou par JavaScript
+            analyse = _Formulaires()
+            analyse.feed(page)
+            if analyse.formulaires:
+                break
+            cible = analyse.rafraichir
+            if not cible:
+                m = re.search(r"(?:window\.)?location(?:\.href)?\s*=\s*['\"]([^'\"]+)['\"]", page)
+                cible = m.group(1) if m else None
+            if not cible:
+                break
+            url, page = lire(urllib.parse.urljoin(url, cible))
+        if _sonde_libre(url, page, sonde, marqueur):
+            return True, "Déjà connecté : pas de portail à franchir."
+        log(f"page du portail : {url}")
+        if not analyse.formulaires:
+            return False, "Page du portail sans formulaire reconnaissable."
+
+        # MikroTik : le mot de passe est chiffre en MD5 avec un defi present dans la page
+        chap = re.search(r"hexMD5\(\s*'((?:\\[0-7]{3})+)'\s*\+\s*document\.\w+\.password\.value\s*\+\s*"
+                         r"'((?:\\[0-7]{3})+)'\s*\)", page)
+        formulaire = max(analyse.formulaires, key=lambda f: (
+            2 * any(c["type"] == "password" for c in f["champs"])
+            + any(c["type"] in ("text", "email", "tel", "number") for c in f["champs"])
+            + any(c["type"] in ("checkbox", "submit") for c in f["champs"])))
+        if chap:
+            envoi = next((f for f in analyse.formulaires if f["nom"] == "sendin"), formulaire)
+            valeurs = {c["nom"]: c["valeur"] for c in envoi["champs"] if c["nom"]}
+            valeurs["username"] = identifiant
+            valeurs["password"] = _hashlib.md5(
+                (_octal(chap.group(1)) + mdp + _octal(chap.group(2))).encode("latin-1")).hexdigest()
+            formulaire = envoi
+            log("portail MikroTik (CHAP)")
+        else:
+            valeurs, textes = {}, [c for c in formulaire["champs"] if c["type"] in ("text", "email", "tel", "number")]
+            soumis = False
+            for c in formulaire["champs"]:
+                if not c["nom"]:
+                    continue
+                if c["type"] == "password":
+                    if not mdp:
+                        return False, "Le portail demande un mot de passe : renseigne-le dans les réglages."
+                    valeurs[c["nom"]] = mdp
+                elif c in textes:
+                    cle = re.search(r"user|login|ident|ticket|code|voucher|pin|name|mail|tel|phone", c["nom"], re.I)
+                    if cle or len(textes) == 1:
+                        if not identifiant and not c["valeur"]:
+                            return False, "Le portail demande un identifiant ou un ticket : renseigne-le dans les réglages."
+                        valeurs[c["nom"]] = identifiant or c["valeur"]
+                    else:
+                        valeurs[c["nom"]] = c["valeur"]
+                elif c["type"] == "checkbox":
+                    valeurs[c["nom"]] = c["valeur"] or "on"
+                elif c["type"] == "radio":
+                    if c["coche"] or c["nom"] not in valeurs:
+                        valeurs[c["nom"]] = c["valeur"]
+                elif c["type"] in ("submit", "image"):
+                    if not soumis:
+                        valeurs[c["nom"]] = c["valeur"]
+                        soumis = True
+                elif c["type"] not in ("reset", "button", "file"):
+                    valeurs[c["nom"]] = c["valeur"]
+        action = urllib.parse.urljoin(url, formulaire["action"] or url)
+        corps = urllib.parse.urlencode(valeurs)
+        log(f"envoi du formulaire vers {action} ({', '.join(valeurs)})")
+        if formulaire["methode"] == "post":
+            lire(action, corps.encode())
+        else:
+            lire(action + ("&" if "?" in action else "?") + corps)
+        url2, page2 = lire(sonde)
+        if _sonde_libre(url2, page2, sonde, marqueur):
+            return True, "Reconnecté au portail."
+        return False, "Le portail n'a pas accepté la connexion (identifiants ou ticket à vérifier)."
+    except Exception as erreur:
+        return False, f"Portail injoignable : {getattr(erreur, 'reason', erreur)}"
+
+
+# -- secours : autre Wi-Fi connu (26/11/2026) --------------------------------------------
+def _champs_nmcli(ligne):
+    return [c.replace("\\:", ":") for c in re.split(r"(?<!\\):", ligne)]
+
+
+def reseaux_wifi_connus():
+    """{ssid: uuid} des profils Wi-Fi enregistres dans NetworkManager."""
+    try:
+        sortie = subprocess.run(["nmcli", "-t", "-f", "UUID,TYPE", "connection", "show"],
+                                capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return {}
+    connus = {}
+    for ligne in sortie.splitlines():
+        uuid, _, type_ = ligne.partition(":")
+        if type_ != "802-11-wireless":
+            continue
+        try:
+            ssid = subprocess.run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", uuid],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            continue
+        if ssid:
+            connus.setdefault(ssid, uuid)
+    return connus
+
+
+def reseaux_wifi_visibles(iface):
+    """{ssid: signal} des Wi-Fi a portee."""
+    try:
+        sortie = subprocess.run(["nmcli", "-t", "-f", "SSID,SIGNAL", "device", "wifi", "list",
+                                 "ifname", iface, "--rescan", "auto"],
+                                capture_output=True, text=True, timeout=25).stdout
+    except Exception:
+        return {}
+    visibles = {}
+    for ligne in sortie.splitlines():
+        champs = _champs_nmcli(ligne)
+        if len(champs) >= 2 and champs[0]:
+            try:
+                visibles[champs[0]] = max(visibles.get(champs[0], 0), int(champs[1]))
+            except ValueError:
+                pass
+    return visibles
+
+
+def choisir_secours(connus, visibles, actuel):
+    candidats = [(visibles[s], s) for s in connus if s in visibles and s != actuel]
+    return max(candidats)[1] if candidats else None
+
+
+# -- veille (26/11/2026) ---------------------------------------------------------------------
+class AntiVeille:
+    """Empeche la mise en veille via systemd-inhibit (sans root) tant qu'il est actif."""
+
+    def __init__(self):
+        self.proc, self.capot = None, None
+
+    def regler(self, actif, capot=False):
+        if actif and self.proc and self.proc.poll() is None and self.capot == capot:
+            return
+        self.arreter()
+        if actif:
+            quoi = "sleep:idle" + (":handle-lid-switch" if capot else "")
+            try:
+                self.proc = subprocess.Popen(
+                    ["systemd-inhibit", f"--what={quoi}", "--who=Optima",
+                     "--why=Partage de connexion en cours", "--mode=block", "sleep", "infinity"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.capot = capot
+            except FileNotFoundError:
+                self.proc = None
+
+    def actif(self):
+        return bool(self.proc and self.proc.poll() is None)
+
+    def arreter(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+
+# -- historique de la qualite (26/11/2026) -------------------------------------------------
+QUALITE_PATH = Path.home() / ".local" / "share" / "optima" / "qualite.json"
+
+
+class HistoriqueQualite:
+    """Une entree par minute : [ping moyen (ms) ou None, perte %, etat]."""
+
+    def __init__(self, chemin=QUALITE_PATH):
+        self.chemin = chemin
+        try:
+            self.minutes = {int(k): v for k, v in json.loads(chemin.read_text()).items()}
+        except (OSError, ValueError, AttributeError):
+            self.minutes = {}
+        self._courante, self._mesures, self._etat = None, [], "ok"
+        self._derniere_ecriture = time.time()
+
+    def ajouter(self, ms, etat, maintenant=None):
+        minute = int((maintenant or time.time()) // 60)
+        if self._courante is not None and minute != self._courante:
+            self._clore()
+        self._courante = minute
+        self._mesures.append(ms)
+        if etat in ("coupe", "portail") or self._etat == "ok":
+            self._etat = etat if etat in ("coupe", "portail") else "ok"
+
+    def _clore(self):
+        if self._mesures:
+            ok = [x for x in self._mesures if x is not None]
+            perte = round(100 * (len(self._mesures) - len(ok)) / len(self._mesures))
+            self.minutes[self._courante] = [round(sum(ok) / len(ok), 1) if ok else None, perte, self._etat]
+        self._mesures, self._etat = [], "ok"
+
+    def sauvegarder(self, forcer=False):
+        if not forcer and time.time() - self._derniere_ecriture < 300:
+            return
+        limite = int(time.time() // 60) - 8 * 24 * 60
+        self.minutes = {k: v for k, v in self.minutes.items() if k >= limite}
+        try:
+            self.chemin.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.chemin.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.minutes))
+            tmp.replace(self.chemin)
+            self._derniere_ecriture = time.time()
+        except OSError:
+            pass
+
+    def periode(self, heures, pas_min, maintenant=None):
+        """Cases de `pas_min` minutes sur les `heures` dernieres heures :
+        [(debut_minute, ping_moyen|None, minutes_coupees, minutes_mesurees)]."""
+        fin = int((maintenant or time.time()) // 60)
+        debut = fin - heures * 60
+        cases = []
+        for d in range(debut - debut % pas_min, fin + 1, pas_min):
+            pings, coupees, mesurees = [], 0, 0
+            for m in range(d, d + pas_min):
+                v = self.minutes.get(m)
+                if v is None:
+                    continue
+                mesurees += 1
+                if v[2] != "ok":
+                    coupees += 1
+                elif v[0] is not None:
+                    pings.append(v[0])
+            cases.append((d, sum(pings) / len(pings) if pings else None, coupees, mesurees))
+        return cases
+
+    def resume(self, heures, maintenant=None):
+        fin = int((maintenant or time.time()) // 60)
+        mins = sorted((m, v) for m, v in self.minutes.items() if m > fin - heures * 60)
+        pings = [v[0] for _m, v in mins if v[0] is not None and v[2] == "ok"]
+        coupures, duree, prec = 0, 0, False
+        for _m, v in mins:
+            coupe = v[2] != "ok"
+            if coupe:
+                duree += 1
+                if not prec:
+                    coupures += 1
+            prec = coupe
+        par_heure = {}
+        for m, v in mins:
+            h = datetime.fromtimestamp(m * 60).hour
+            par_heure.setdefault(h, []).append(9999 if v[2] != "ok" else (v[0] if v[0] is not None else 9999))
+        meilleures = sorted((sum(l) / len(l), h) for h, l in par_heure.items() if len(l) >= 10)
+        return {"ping": sum(pings) / len(pings) if pings else None, "coupures": coupures,
+                "minutes_coupees": duree, "meilleure_heure": meilleures[0][1] if meilleures else None,
+                "mesures": len(mins)}
+
+
+# -- filtrage des sites (26/11/2026) -----------------------------------------------------
+FILTRE_PATH = Path.home() / ".config" / "optima" / "filtre.txt"
+SITES_PATH = Path.home() / ".local" / "share" / "optima" / "sites.json"
+CATEGORIES_FILTRE = {
+    "pub": ("Publicité et pisteurs", [
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adservice.google.com",
+        "taboola.com", "outbrain.com", "adnxs.com", "criteo.com", "criteo.net", "pubmatic.com",
+        "rubiconproject.com", "scorecardresearch.com", "amazon-adsystem.com", "adsrvr.org", "moatads.com",
+        "app-measurement.com", "applovin.com", "unityads.unity3d.com", "ads-api.tiktok.com", "an.facebook.com",
+        "adcolony.com", "chartboost.com", "inmobi.com", "mopub.com", "smaato.net", "startappservice.com"]),
+    "reseaux": ("Réseaux sociaux", [
+        "facebook.com", "fbcdn.net", "instagram.com", "cdninstagram.com", "tiktok.com", "tiktokcdn.com",
+        "tiktokv.com", "byteoversea.com", "ibytedtos.com", "snapchat.com", "sc-cdn.net", "snapkit.com",
+        "twitter.com", "x.com", "twimg.com", "threads.net", "pinterest.com", "pinimg.com", "reddit.com",
+        "redditmedia.com", "redd.it", "linkedin.com", "licdn.com"]),
+    "video": ("Vidéo et streaming", [
+        "youtube.com", "googlevideo.com", "ytimg.com", "youtu.be", "youtube-nocookie.com", "netflix.com",
+        "nflxvideo.net", "nflxso.net", "primevideo.com", "aiv-cdn.net", "twitch.tv", "ttvnw.net",
+        "dailymotion.com", "dmcdn.net", "disneyplus.com", "bamgrid.com", "vimeo.com", "vimeocdn.com"]),
+    "jeux": ("Jeux en ligne", [
+        "roblox.com", "rbxcdn.com", "epicgames.com", "fortnite.com", "steampowered.com", "steamcontent.com",
+        "steamserver.net", "supercell.com", "garena.com", "freefiremobile.com", "pubgmobile.com",
+        "activision.com", "callofduty.com", "ea.com", "riotgames.com", "minecraft.net"]),
+    "adultes": ("Sites pour adultes", [
+        "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com", "redtube.com", "youporn.com",
+        "onlyfans.com", "chaturbate.com", "stripchat.com", "spankbang.com", "eporner.com", "phncdn.com"]),
+}
+
+
+def domaines_filtre(categories, perso):
+    domaines = []
+    for cat in categories:
+        domaines += CATEGORIES_FILTRE.get(cat, ("", []))[1]
+    for ligne in (perso or "").replace(",", "\n").splitlines():
+        d = ligne.strip().lower()
+        d = re.sub(r"^(https?://)?(www\.)?", "", d).split("/")[0]
+        if re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", d):
+            domaines.append(d)
+    return sorted(set(domaines))
+
+
+def ecrire_filtre(cfg):
+    domaines = domaines_filtre(cfg.get("filtre_categories", []), cfg.get("filtre_perso", "")) \
+        if cfg.get("filtre_actif") else []
+    FILTRE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FILTRE_PATH.write_text("".join(d + "\n" for d in domaines))
+    return domaines
+
+
+def domaine_principal(nom):
+    morceaux = nom.lower().rstrip(".").split(".")
+    if len(morceaux) >= 3 and len(morceaux[-1]) == 2 and morceaux[-2] in ("co", "com", "org", "net", "gov", "ac", "edu", "gouv"):
+        return ".".join(morceaux[-3:])
+    return ".".join(morceaux[-2:])
+
+
+class JournalSites:
+    """Lit le journal DNS de dnsmasq (/run/optima/dns.log) et compte, par jour et par
+    appareil, les sites demandes. Stocke dans sites.json (30 jours)."""
+
+    IGNORES = ("in-addr.arpa", "ip6.arpa", "local", "lan", "localdomain")
+
+    def __init__(self, chemin=SITES_PATH, log=RUN_DIR / "dns.log", baux=RUN_DIR / "dnsmasq.leases"):
+        self.chemin, self.log, self.baux = chemin, log, baux
+        try:
+            self.donnees = json.loads(chemin.read_text())
+        except (OSError, ValueError):
+            self.donnees = {}
+        self._position = 0
+
+    def lire(self):
+        try:
+            taille = self.log.stat().st_size
+        except OSError:
+            return 0
+        if taille < self._position:
+            self._position = 0
+        ips = {}
+        try:
+            for ligne in self.baux.read_text().splitlines():
+                champs = ligne.split()
+                if len(champs) >= 3:
+                    ips[champs[2]] = champs[1].lower()
+        except OSError:
+            pass
+        n = 0
+        try:
+            with open(self.log, "r", errors="replace") as f:
+                f.seek(self._position)
+                for ligne in f:
+                    m = re.search(r"query\[(?:A|AAAA|HTTPS)\] (\S+) from (\S+)", ligne)
+                    if not m:
+                        continue
+                    nom, ip = m.groups()
+                    if nom.endswith(self.IGNORES) or "." not in nom:
+                        continue
+                    mac = ips.get(ip, ip)
+                    jour = self.donnees.setdefault(date.today().isoformat(), {})
+                    sites = jour.setdefault(mac, {})
+                    d = domaine_principal(nom)
+                    sites[d] = sites.get(d, 0) + 1
+                    n += 1
+                self._position = f.tell()
+            if self._position > 5 * MO:   # on vide le journal pour qu'il ne grossisse pas
+                with open(self.log, "r+") as f:
+                    f.truncate(0)
+                self._position = 0
+        except OSError:
+            pass
+        if n:
+            limite = (date.today() - timedelta(days=30)).isoformat()
+            self.donnees = {k: v for k, v in self.donnees.items() if k >= limite}
+            try:
+                self.chemin.write_text(json.dumps(self.donnees))
+            except OSError:
+                pass
+        return n
+
+    def classement(self, jours, mac=None):
+        debut = (date.today() - timedelta(days=jours - 1)).isoformat()
+        cumul = {}
+        for k, jour in self.donnees.items():
+            if k < debut:
+                continue
+            for m, sites in jour.items():
+                if mac and m != mac:
+                    continue
+                for d, n in sites.items():
+                    cumul[d] = cumul.get(d, 0) + n
+        return sorted(cumul.items(), key=lambda e: -e[1])
+
+    def appareils(self, jours):
+        debut = (date.today() - timedelta(days=jours - 1)).isoformat()
+        total = {}
+        for k, jour in self.donnees.items():
+            if k >= debut:
+                for m, sites in jour.items():
+                    total[m] = total.get(m, 0) + sum(sites.values())
+        return [m for m, _n in sorted(total.items(), key=lambda e: -e[1])]
+
+
+# -- partage par cable Ethernet (26/11/2026) ----------------------------------------------
+PROFIL_CABLE = "Optima câble"
+
+
+def interface_ethernet():
+    try:
+        sortie = subprocess.run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"], capture_output=True,
+                                text=True, timeout=5).stdout
+    except Exception:
+        return None
+    for ligne in sortie.splitlines():
+        dev, _, type_ = ligne.partition(":")
+        if type_ == "ethernet":
+            return dev
+    return None
+
+
+def profil_cable(activer, iface):
+    """Cree (ou supprime) le profil NetworkManager « partage » du port Ethernet :
+    adresse 10.43.0.1/24, DHCP fourni par NetworkManager. Pas de connexion auto :
+    Optima l'active seulement quand un appareil (et non une box) est branche."""
+    try:
+        existe = subprocess.run(["nmcli", "-g", "connection.id", "connection", "show", PROFIL_CABLE],
+                                capture_output=True, text=True, timeout=10).returncode == 0
+        if not activer:
+            if existe:
+                subprocess.run(["nmcli", "connection", "delete", PROFIL_CABLE], capture_output=True, timeout=20)
+            return True, ""
+        args = ["ifname", iface, "ipv4.method", "shared", "ipv4.addresses", "10.43.0.1/24",
+                "ipv6.method", "disabled", "connection.autoconnect", "no"]
+        if existe:
+            r = subprocess.run(["nmcli", "connection", "modify", PROFIL_CABLE, *args[2:]],
+                               capture_output=True, text=True, timeout=20)
+        else:
+            r = subprocess.run(["nmcli", "connection", "add", "type", "ethernet", "con-name", PROFIL_CABLE, *args],
+                               capture_output=True, text=True, timeout=20)
+        return r.returncode == 0, (r.stderr or r.stdout).strip()
+    except Exception as erreur:
+        return False, str(erreur)
+
+
+def cable_branche(iface):
+    try:
+        return Path(f"/sys/class/net/{iface}/carrier").read_text().strip() == "1"
+    except OSError:
+        return False
+
+
+def etat_ethernet(iface):
+    """(profil actif, a une passerelle) du port Ethernet."""
+    try:
+        sortie = subprocess.run(["nmcli", "-g", "GENERAL.CONNECTION,IP4.GATEWAY", "device", "show", iface],
+                                capture_output=True, text=True, timeout=5).stdout.splitlines()
+    except Exception:
+        return None, False
+    profil = sortie[0].strip() if sortie else ""
+    passerelle = len(sortie) > 1 and bool(sortie[1].strip())
+    return profil or None, passerelle
+
+
+def clients_cable(iface):
+    try:
+        return len([l for l in Path(f"/var/lib/NetworkManager/dnsmasq-{iface}.leases").read_text().splitlines() if l])
+    except OSError:
+        return 0
+
+
+def compteurs_interface(iface):
+    base = Path("/sys/class/net") / iface / "statistics"
+    try:
+        return int((base / "tx_bytes").read_text()), int((base / "rx_bytes").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+# -- rapport PDF de la semaine (26/11/2026) ---------------------------------------------
+def generer_rapport(chemin, compteur, qualite, sites, noms, tests, jours=7):
+    """PDF A4 : donnees par jour, appareils, sites, qualite de la connexion, tests de vitesse."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_pdf import PdfPages
+    bleu, vert, rouge, gris = "#007aff", "#34c759", "#ff3b30", "#6e6e73"
+    serie = compteur.serie(jours)
+    debut, fin = serie[0][0], serie[-1][0]
+    total = sum(b + h for _d, b, h in serie)
+    fig = Figure(figsize=(8.27, 11.69))
+    fig.text(0.07, 0.955, "Optima — rapport de la semaine", fontsize=20, weight="bold")
+    fig.text(0.07, 0.93, f"Du {debut:%d/%m/%Y} au {fin:%d/%m/%Y}", fontsize=11, color=gris)
+    res = qualite.resume(jours * 24)
+    lignes = [("Données partagées", format_octets(total)),
+              ("Moyenne par jour", format_octets(total / jours)),
+              ("Appareils différents", str(len(compteur.classement(jours)))),
+              ("Ping moyen", f"{res['ping']:.0f} ms" if res["ping"] else "—"),
+              ("Coupures d'Internet", f"{res['coupures']} ({res['minutes_coupees']} min)" if res["mesures"] else "—")]
+    for i, (k, v) in enumerate(lignes):
+        x = 0.07 + (i % 3) * 0.31
+        y = 0.875 - (i // 3) * 0.055
+        fig.text(x, y + 0.018, k, fontsize=9, color=gris)
+        fig.text(x, y, v, fontsize=14, weight="bold")
+    ax = fig.add_axes([0.08, 0.6, 0.86, 0.17])
+    etiquettes = [JOURS_SEMAINE[d.weekday()] + d.strftime(" %d") for d, _b, _h in serie]
+    ax.bar(etiquettes, [b / MO for _d, b, _h in serie], color=bleu, label="Reçu")
+    ax.bar(etiquettes, [h / MO for _d, _b, h in serie], bottom=[b / MO for _d, b, _h in serie],
+           color=vert, label="Envoyé")
+    ax.set_ylabel("Mo")
+    ax.set_title("Données par jour", loc="left", fontsize=11)
+    ax.legend(frameon=False, fontsize=8)
+    for cote in ("top", "right"):
+        ax.spines[cote].set_visible(False)
+    y = 0.53
+    fig.text(0.07, y, "Appareils les plus gourmands", fontsize=11, weight="bold")
+    for mac, (b, h) in compteur.classement(jours)[:6]:
+        y -= 0.022
+        fig.text(0.09, y, noms(mac), fontsize=10)
+        fig.text(0.45, y, format_octets(b + h), fontsize=10, weight="bold")
+    y2 = 0.53
+    top = sites.classement(jours) if sites else []
+    fig.text(0.55, y2, "Sites les plus consultés", fontsize=11, weight="bold")
+    if not top:
+        fig.text(0.57, y2 - 0.022, "Journal des sites désactivé.", fontsize=9, color=gris)
+    for d, n in top[:6]:
+        y2 -= 0.022
+        fig.text(0.57, y2, d, fontsize=10)
+        fig.text(0.85, y2, str(n), fontsize=10, color=gris)
+    ax2 = fig.add_axes([0.08, 0.2, 0.86, 0.15])
+    cases = qualite.periode(jours * 24, 60)
+    xs = [datetime.fromtimestamp(c[0] * 60) for c in cases]
+    ax2.plot(xs, [c[1] if c[1] is not None else float("nan") for c in cases], color=bleu, linewidth=1.2)
+    for x, c in zip(xs, cases):
+        if c[2]:   # largeur = duree reelle de la coupure dans l'heure
+            ax2.axvspan(x, x + timedelta(minutes=max(c[2], 8)), color=rouge, alpha=0.7, linewidth=0)
+    import matplotlib.dates as mdates
+    ax2.set_xlim(datetime.combine(debut, datetime.min.time()), datetime.combine(fin, datetime.max.time()))
+    ax2.xaxis.set_major_locator(mdates.DayLocator())
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m"))
+    ax2.set_ylim(bottom=0)
+    ax2.set_ylabel("ms")
+    ax2.set_title("Qualité de la connexion source (ping, coupures en rouge)", loc="left", fontsize=11)
+    for cote in ("top", "right"):
+        ax2.spines[cote].set_visible(False)
+    ax2.tick_params(labelsize=7)
+    sem = [t_ for t_ in tests if t_.get("date")][-5:]
+    if sem:
+        fig.text(0.07, 0.13, "Derniers tests de vitesse", fontsize=11, weight="bold")
+        fig.text(0.07, 0.105, "   ".join(f"{t_['date']} : ↓ {t_['bas'] / 1e6:.1f} Mbit/s" for t_ in sem),
+                 fontsize=8, color=gris)
+    fig.text(0.07, 0.025, f"Généré par Optima le {datetime.now():%d/%m/%Y à %H:%M}", fontsize=7, color=gris)
+    with PdfPages(chemin) as pdf:
+        pdf.savefig(fig)
+    return chemin
 
 
 def dossier_documents():
@@ -1086,6 +1754,20 @@ class OptimaApp(tk.Tk):
         self._garde_en_cours = False
         self._keyids = {}            # mac -> keyid (« invite ») lu dans hostapd
         self._ip_limitees = {}       # mac -> ip au moment ou la limite a ete appliquee
+        # 26/11/2026 (3)
+        self.anti_veille = AntiVeille()
+        self.qualite_hist = HistoriqueQualite()
+        self._acl_horaire = set()    # appareils mis en pause par leur horaire
+        self._portail_essai = 0.0
+        self._portail_en_cours = False
+        self._probleme_depuis = None
+        self._bascule_essai = 0.0
+        self._bascule_en_cours = False
+        self._label_barre = None
+        self.journal_sites = JournalSites()
+        self._iface_cable = None
+        self._cable = {"branche": False, "verifie": False, "actif": False, "clients": 0}
+        self._rapport_verifie = 0.0
         # Les fils d'arriere-plan (statut, pkexec, icone de la barre) ne touchent
         # jamais Tk directement : ils deposent une fonction ici, executee par Tk.
         self._file = queue.Queue()
@@ -1098,6 +1780,7 @@ class OptimaApp(tk.Tk):
         self._boucle_statut()
         self.after(1500, self._boucle_qualite)
         self.after(2000, self._boucle_garde)
+        self.after(4000, self._boucle_lente)
 
         if mode_auto:
             if TRAY_DISPONIBLE:
@@ -1475,17 +2158,28 @@ class OptimaApp(tk.Tk):
                          f"↑ {format_octets(int(st.get('rx_bytes', 0)))}")
             else:
                 conso = mac
-            du_jour = self.compteur.appareil_jour(mac)
+            periode = self.config_actuelle.get("quota_appareil_periode", "jour")
             limite = int(self.config_actuelle.get("quota_appareil_mo") or 0) * MO
+            mot = {"semaine": "cette semaine", "mois": "ce mois-ci"}.get(periode, "aujourd'hui") if limite else "aujourd'hui"
+            du_jour = self.compteur.appareil_periode(mac, periode if limite else "jour")
             if limite:
-                conso += f"   ·   aujourd'hui {format_octets(du_jour)} / {format_octets(limite)}"
+                conso += f"   ·   {mot} {format_octets(du_jour)} / {format_octets(limite)}"
             elif du_jour:
-                conso += f"   ·   aujourd'hui {format_octets(du_jour)}"
+                conso += f"   ·   {mot} {format_octets(du_jour)}"
             ligne["conso"].config(text=conso,
                                   fg=t["orange"] if limite and du_jour >= 0.8 * limite else t["texte_att"])
             invite = self._keyids.get(mac) == "invite"
-            ligne["etat"].config(text="Internet coupé" if coupe else ("Invité" if invite else ""),
-                                 fg=t["orange"] if coupe else t["bleu"])
+            pause = mac in self._acl_horaire
+            if pause:
+                h = self.config_actuelle["horaires_appareils"].get(mac, {})
+                texte_etat, couleur = f"En pause jusqu'à {h.get('fin', '?')}", t["orange"]
+            elif coupe:
+                texte_etat, couleur = "Internet coupé", t["orange"]
+            else:
+                texte_etat, couleur = ("Invité" if invite else ""), t["bleu"]
+            if mac == self.config_actuelle.get("appareil_prioritaire") and not texte_etat:
+                texte_etat, couleur = "Prioritaire", t["accent"]
+            ligne["etat"].config(text=texte_etat, fg=couleur)
             ligne["bouton_couper"].configurer(texte="Rétablir Internet" if coupe else "Couper Internet",
                                               style="bleu" if coupe else "secondaire")
             ligne["coupe"] = coupe
@@ -1523,7 +2217,7 @@ class OptimaApp(tk.Tk):
                      taille=11, hauteur=px(26)).pack(side="left", padx=px(6))
         BoutonPilule(boutons, t, "Renommer", lambda: self._renommer(mac),
                      taille=11, hauteur=px(26)).pack(side="left")
-        BoutonPilule(boutons, t, "Débit", lambda: self._choisir_debit(mac),
+        BoutonPilule(boutons, t, "Options", lambda: self._options_appareil(mac),
                      taille=11, hauteur=px(26)).pack(side="left", padx=px((6, 0)))
         tk.Frame(cadre, bg=t["bordure"], height=max(1, px(1))).pack(fill="x", pady=px((10, 0)))
         return ligne
@@ -1716,7 +2410,25 @@ class OptimaApp(tk.Tk):
         return ("start", ssid, mdp, str(c.get("max_clients", 20)), str(c.get("bandwidth_mbps", 0)),
                 "1" if c.get("reseau_masque") else "0", "1" if c.get("isoler_appareils") else "0",
                 c.get("dns", "auto") if c.get("dns") in ("auto", "cloudflare", "google", "quad9") else "auto",
-                ",".join(f"{m}={k}" for m, k in c.get("limites_debit", {}).items() if int(k) > 0))
+                ",".join(f"{m}={k}" for m, k in c.get("limites_debit", {}).items() if int(k) > 0),
+                self._options_systeme())
+
+    def _options_systeme(self):
+        c = self.config_actuelle
+        prio = c.get("appareil_prioritaire")
+        capacite = self._capacite_kbit()
+        options = [f"filtre={1 if c.get('filtre_actif') else 0}", f"journal={1 if c.get('journal_sites') else 0}"]
+        if prio and capacite:
+            options.append(f"priorite={prio}:{capacite}")
+        if c.get("filaire") and self._iface_cable:
+            options.append(f"filaire={self._iface_cable}")
+        if c.get("filtre_actif"):
+            ecrire_filtre(c)
+        return ";".join(options)
+
+    def _capacite_kbit(self):
+        tests = self.config_actuelle.get("tests_vitesse") or []
+        return int(tests[-1]["bas"] * 0.9 / 1000) if tests else 0
 
     def _on_arreter(self, auto=False, raison=None):
         self.arret_programme = None
@@ -1807,8 +2519,11 @@ class OptimaApp(tk.Tk):
                 dt = max(0.2, maintenant - t0)
                 vb, vh = max(0, bas - b0) / dt, max(0, haut - h0) / dt
                 self.graphe.ajouter(vb, vh)
+                if int(maintenant) % 2 == 0:
+                    self._maj_label_barre(vb, vh)
                 self.stat_vals["vitesse"].config(text=f"↓ {format_debit(vb)}\n↑ {format_debit(vh)}")
             elif not compteurs:
+                self._maj_label_barre(0, 0)
                 self.graphe.ajouter(0, 0)
                 self.stat_vals["vitesse"].config(text="—")
             if compteurs:
@@ -1883,7 +2598,10 @@ class OptimaApp(tk.Tk):
             if source:
                 self.label_source.config(text=f"Connexion partagée : {source}")
             n = len(appareils)
-            self.stat_vals["appareils"].config(text=f"{n} connecté{'s' if n > 1 else ''}")
+            texte_n = f"{n} connecté{'s' if n > 1 else ''}"
+            if self._cable.get("actif"):
+                texte_n += f"\n+ {self._cable.get('clients', 0)} par câble"
+            self.stat_vals["appareils"].config(text=texte_n)
         else:
             self._session_depart = None
             self.label_etat.config(text="Partage arrêté", fg=t["texte"])
@@ -1893,6 +2611,9 @@ class OptimaApp(tk.Tk):
             self.stat_vals["appareils"].config(text="—")
         self._traiter_diff_appareils(appareils)
         self._afficher_appareils(appareils)
+        mode_veille = self.config_actuelle.get("anti_veille", "appareils")
+        self.anti_veille.regler(actif and (mode_veille == "toujours" or (mode_veille == "appareils" and bool(appareils))),
+                                bool(self.config_actuelle.get("anti_veille_capot")))
         if actif:
             self._verifier_quotas_appareils(appareils)
             self._suivre_invite(stations)
@@ -2000,12 +2721,16 @@ class OptimaApp(tk.Tk):
         limite = int(c.get("quota_appareil_mo") or 0) * MO
         if limite <= 0:
             return
-        aujourdhui = date.today().isoformat()
+        periode = c.get("quota_appareil_periode", "jour")
+        aujourdhui = date.today()
+        id_periode = {"semaine": f"{aujourdhui.isocalendar()[0]}-S{aujourdhui.isocalendar()[1]}",
+                      "mois": aujourdhui.isoformat()[:7]}.get(periode, aujourdhui.isoformat())
+        libelle = {"semaine": "de la semaine", "mois": "du mois"}.get(periode, "du jour")
         for app in appareils:
             mac = app.get("mac")
-            if not mac or cp.appareil_jour(mac) < limite:
+            if not mac or cp.appareil_periode(mac, periode) < limite:
                 continue
-            cle = f"app|{aujourdhui}|{mac}"
+            cle = f"app|{id_periode}|{mac}"
             if cp.alerte_deja(cle):
                 continue
             nom = self._nom_appareil(app)
@@ -2015,13 +2740,13 @@ class OptimaApp(tk.Tk):
                 cp.noter_alerte(cle)
                 self._executer(lambda m=mac: executer_privilegie("cut", m),
                                f"{nom} a atteint sa limite : coupure d'Internet…",
-                               f"{nom} a atteint sa limite du jour ({format_octets(limite)}) : "
+                               f"{nom} a atteint sa limite {libelle} ({format_octets(limite)}) : "
                                f"Internet coupé pour cet appareil.", notifier=True)
                 return
             cp.noter_alerte(cle)
             envoyer_notification("Optima — limite d'un appareil",
-                                 f"{nom} a utilisé {format_octets(cp.appareil_jour(mac))} aujourd'hui "
-                                 f"(limite {format_octets(limite)}).")
+                                 f"{nom} a utilisé {format_octets(cp.appareil_periode(mac, periode))} "
+                                 f"(limite {libelle} : {format_octets(limite)}).")
 
     # -- plages horaires (26/11/2026) ---------------------------------------------------
     def _verifier_planning(self):
@@ -2120,6 +2845,17 @@ class OptimaApp(tk.Tk):
             texte = f"Connexion source {mot} · {moyenne:.0f} ms · {perte} % de perte"
         self._niveau_qualite, self._texte_qualite = niveau, texte
         self._afficher_qualite()
+        if niveau not in ("mesure", "off", "aucune"):
+            self.qualite_hist.ajouter(ms, niveau)
+            self.qualite_hist.sauvegarder()
+        if niveau in ("portail", "coupe"):
+            if self._probleme_depuis is None:
+                self._probleme_depuis = time.time()
+        else:
+            self._probleme_depuis = None
+        if niveau == "portail":
+            self._reconnecter_portail()
+        self._verifier_bascule()
         if self.etat.get("running") and ancien not in (None, "mesure", "off", "aucune") and niveau != ancien:
             if niveau == "portail":
                 envoyer_notification("Optima — reconnexion nécessaire",
@@ -2158,21 +2894,411 @@ class OptimaApp(tk.Tk):
         except FileNotFoundError:
             self._message("Ouvre un navigateur sur http://neverssl.com pour te reconnecter.", "orange")
 
+    # -- portail captif automatique (26/11/2026) ---------------------------------------
+    def _reconnecter_portail(self, manuel=False, rappel=None):
+        c = self.config_actuelle
+        if not manuel and (not c.get("portail_auto") or time.time() - self._portail_essai < 90):
+            return
+        if self._portail_en_cours:
+            return
+        self._portail_en_cours = True
+        self._portail_essai = time.time()
+        if not manuel:
+            self._message("Portail captif détecté : reconnexion automatique…")
+
+        def tache():
+            journal = []
+            ok, texte = connexion_portail(c.get("portail_identifiant", ""), c.get("portail_mdp", ""),
+                                          journal=journal)
+            if ok:
+                self._derniere_verif = 0.0
+                ok = verifier_connectivite() in ("full", "unknown")
+                if not ok:
+                    texte = "Le formulaire a été envoyé mais Internet ne répond toujours pas."
+
+            def fin():
+                self._portail_en_cours = False
+                self._connectivite = "full" if ok else self._connectivite
+                self._message(("✓ " if ok else "⚠ ") + texte, "accent" if ok else "orange")
+                if not manuel:
+                    envoyer_notification("Optima" if ok else "Optima — portail captif",
+                                         "Reconnecté automatiquement au portail captif." if ok else texte)
+                if rappel:
+                    rappel(ok, texte, journal)
+            self._en_main(fin)
+
+        threading.Thread(target=tache, daemon=True).start()
+
+    # -- secours : autre Wi-Fi connu (26/11/2026) ---------------------------------------
+    def _verifier_bascule(self):
+        c = self.config_actuelle
+        if (not c.get("bascule_auto") or not self.etat.get("running") or self._probleme_depuis is None
+                or self._bascule_en_cours or self._occupe or self._portail_en_cours):
+            return
+        if time.time() - self._probleme_depuis < int(c.get("bascule_delai_s", 90) or 90):
+            return
+        if time.time() - self._bascule_essai < 300:
+            return
+        self._bascule_en_cours = True
+        self._bascule_essai = time.time()
+        uplink = self.etat.get("uplink")
+        actuel = nom_reseau_source(uplink)
+
+        def tache():
+            visibles = reseaux_wifi_visibles(uplink)
+            connus = reseaux_wifi_connus()
+            cible = choisir_secours(connus, visibles, actuel)
+            ok = False
+            if cible:
+                r = subprocess.run(["nmcli", "connection", "up", "uuid", connus[cible], "ifname", uplink],
+                                   capture_output=True, text=True, timeout=60)
+                ok = r.returncode == 0
+                if ok:
+                    for _ in range(10):
+                        if verifier_connectivite() == "full":
+                            break
+                        time.sleep(3)
+
+            def fin():
+                self._bascule_en_cours = False
+                if not cible:
+                    envoyer_notification("Optima — Internet coupé",
+                                         "Aucun autre Wi-Fi connu n'est à portée pour prendre le relais.")
+                    return
+                if not ok:
+                    envoyer_notification("Optima", f"Impossible de basculer sur « {cible} ».")
+                    return
+                envoyer_notification("Optima", f"Internet ne revenait pas : bascule sur « {cible} », "
+                                               "le partage redémarre.")
+                self._probleme_depuis = None
+                self._on_demarrer()
+            self._en_main(fin)
+
+        threading.Thread(target=tache, daemon=True).start()
+
+    # -- debit dans la barre du haut (26/11/2026) -------------------------------------------
+    def _maj_label_barre(self, bas, haut):
+        if not (TRAY_DISPONIBLE and self.icone_tray):
+            return
+        ind = getattr(self.icone_tray, "_appindicator", None)
+        if ind is None:
+            return
+        texte = ""
+        if self.config_actuelle.get("debit_dans_barre", True) and self.etat.get("running"):
+            n = len(self.etat.get("devices") or [])
+            texte = f"↓{format_debit(bas).replace(' ', '')} · {n}"
+        if texte == self._label_barre:
+            return
+        self._label_barre = texte
+        try:
+            from gi.repository import GLib
+            GLib.idle_add(lambda: ind.set_label(texte, "↓99.9Mbit/s · 9") and False)
+        except Exception:
+            pass
+
+    # -- boucle lente : cable, journal des sites, rapport (26/11/2026) ----------------------
+    def _boucle_lente(self):
+        try:
+            c = self.config_actuelle
+            if self._iface_cable is None:
+                self._iface_cable = interface_ethernet() or ""
+            if c.get("journal_sites") and self.etat.get("running"):
+                threading.Thread(target=self.journal_sites.lire, daemon=True).start()
+            self._suivre_cable()
+            if time.time() - self._rapport_verifie > 3600:
+                self._rapport_verifie = time.time()
+                self._rapport_auto()
+            self.after(5000, self._boucle_lente)
+        except tk.TclError:
+            pass
+
+    def _suivre_cable(self):
+        c, iface, etat = self.config_actuelle, self._iface_cable, self._cable
+        if not (c.get("filaire") and iface):
+            etat.update(branche=False, verifie=False, actif=False)
+            return
+        branche = cable_branche(iface)
+        if not branche:
+            etat.update(branche=False, verifie=False, actif=False, clients=0)
+            self.compteur.ajouter_interface("cable", None)
+            return
+        etat["branche"] = True
+        if etat["actif"]:
+            etat["clients"] = clients_cable(iface)
+            self.compteur.ajouter_interface("cable", compteurs_interface(iface))
+            return
+        if etat["verifie"] or not self.etat.get("running") or etat.get("en_cours"):
+            return
+        etat["en_cours"] = True
+
+        def tache():
+            # Cable relie a une box (elle donne une passerelle) -> on ne partage pas dessus.
+            profil, passerelle = None, False
+            for _ in range(10):
+                profil, passerelle = etat_ethernet(iface)
+                if profil == PROFIL_CABLE or passerelle:
+                    break
+                time.sleep(2)
+            actif = profil == PROFIL_CABLE
+            message = None
+            if not actif and not passerelle:
+                r = subprocess.run(["nmcli", "connection", "up", PROFIL_CABLE, "ifname", iface],
+                                   capture_output=True, text=True, timeout=40)
+                actif = r.returncode == 0
+                message = ("Câble : partage actif pour l'appareil branché." if actif
+                           else "Câble : impossible d'activer le partage.")
+            elif passerelle:
+                message = "Câble relié à une box ou un routeur : Optima ne partage pas dessus."
+
+            def fin():
+                etat.update(verifie=True, actif=actif, en_cours=False)
+                if message:
+                    self._message(("✓ " if actif else "") + message, "accent" if actif else "texte_att")
+                    if actif:
+                        envoyer_notification("Optima", message)
+            self._en_main(fin)
+
+        threading.Thread(target=tache, daemon=True).start()
+
+    def _rapport_auto(self):
+        c = self.config_actuelle
+        aujourdhui = date.today()
+        semaine = f"{aujourdhui.isocalendar()[0]}-S{aujourdhui.isocalendar()[1]:02d}"
+        if not c.get("rapport_hebdo", True) or aujourdhui.weekday() != 0 or datetime.now().hour < 8:
+            return
+        if c.get("dernier_rapport") == semaine or self.compteur.total_periode(7) == 0:
+            return
+        c["dernier_rapport"] = semaine
+        sauvegarder_config(c)
+        self._faire_rapport(ouvrir=False)
+
+    def _faire_rapport(self, ouvrir=True, rappel=None):
+        dossier = dossier_documents() / "Optima"
+        chemin = dossier / f"rapport-{date.today().isoformat()}.pdf"
+        tests = list(self.config_actuelle.get("tests_vitesse") or [])
+        self.qualite_hist._clore()
+
+        def tache():
+            try:
+                dossier.mkdir(parents=True, exist_ok=True)
+                generer_rapport(chemin, self.compteur, self.qualite_hist,
+                                self.journal_sites if self.config_actuelle.get("journal_sites") else None,
+                                lambda m: self._nom_appareil({"mac": m}) if m != "cable" else "Câble Ethernet",
+                                tests)
+                ok, texte = True, str(chemin)
+            except Exception as erreur:
+                ok, texte = False, str(erreur)
+
+            def fin():
+                if ok:
+                    envoyer_notification("Optima", f"Rapport de la semaine prêt : {chemin.name} (Documents/Optima)")
+                    if ouvrir:
+                        subprocess.Popen(["xdg-open", str(chemin)], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                if rappel:
+                    rappel(ok, texte)
+            self._en_main(fin)
+
+        threading.Thread(target=tache, daemon=True).start()
+
+    # -- reglages d'un appareil : debit, priorite, horaire (26/11/2026) ---------------------
+    def _options_appareil(self, mac):
+        t = self.t
+        app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {"mac": mac})
+        nom = self._nom_appareil(app)
+        c = self.config_actuelle
+        fen = tk.Toplevel(self, bg=t["fond"])
+        fen.title("Réglages de l'appareil")
+        fen.transient(self)
+        fen.resizable(False, False)
+        tk.Label(fen, text=nom, font=(POLICE, 16, "bold"), bg=t["fond"], fg=t["texte"]).pack(
+            anchor="w", padx=px(20), pady=px((18, 0)))
+        tk.Label(fen, text=f"{app.get('ip', '')}  ·  {mac}", font=(POLICE, 11), bg=t["fond"],
+                 fg=t["texte_att"]).pack(anchor="w", padx=px(20))
+
+        # debit
+        carte = Carte(fen, t, titre="DÉBIT MAXIMUM")
+        carte.pack(fill="x", padx=px(16), pady=px((12, 0)))
+        actuel = int(c["limites_debit"].get(mac, 0))
+        rangee = tk.Frame(carte.corps, bg=t["carte"])
+        rangee.pack(fill="x")
+        boutons = {}
+
+        def debit(kbit):
+            if kbit == int(c["limites_debit"].get(mac, 0)):
+                return
+            for k, b in boutons.items():
+                b.configurer(style="bleu" if k == kbit else "secondaire")
+            self._appliquer_debit(mac, kbit, nom)
+
+        for kbit in DEBITS_APPAREIL:
+            lib = "Illimité" if kbit == 0 else f"{kbit // 1000} Mbit/s"
+            b = BoutonPilule(rangee, t, lib, lambda k=kbit: debit(k), taille=11, hauteur=px(30),
+                             style="bleu" if kbit == actuel else "secondaire")
+            b.pack(side="left", padx=px((0, 5)))
+            boutons[kbit] = b
+
+        # priorite
+        carte_p = Carte(fen, t, titre="PRIORITÉ")
+        carte_p.pack(fill="x", padx=px(16), pady=px((12, 0)))
+        var_prio = tk.BooleanVar(value=c.get("appareil_prioritaire") == mac)
+        l = tk.Frame(carte_p.corps, bg=t["carte"])
+        l.pack(fill="x")
+        inter = Interrupteur(l, t, var_prio)
+        inter.pack(side="right", anchor="n")
+        bloc = tk.Frame(l, bg=t["carte"])
+        bloc.pack(side="left", fill="x", expand=True)
+        tk.Label(bloc, text="Passer avant les autres", font=(POLICE, 12), bg=t["carte"], fg=t["texte"],
+                 anchor="w").pack(fill="x")
+        capacite = self._capacite_kbit()
+        aide = (f"Quand la connexion sature, cet appareil est servi en premier (réglé sur "
+                f"{format_kbit(capacite)}, d'après ton dernier test de vitesse). Un seul appareil à la fois."
+                if capacite else "Fais d'abord un test de vitesse : Optima en a besoin pour régler la priorité.")
+        tk.Label(bloc, text=aide, font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"], anchor="w",
+                 wraplength=px(330), justify="left").pack(fill="x")
+        if not capacite:
+            BoutonPilule(carte_p.corps, t, "Faire un test de vitesse", lambda: (fen.destroy(), self._ouvrir_vitesse()),
+                         taille=11, hauteur=px(28), style="bleu").pack(anchor="w", pady=px((8, 0)))
+
+        def basculer_prio(_e=None):
+            fen.after(50, lambda: self._appliquer_priorite(mac if var_prio.get() else None, nom))
+        inter.bind("<ButtonRelease-1>", basculer_prio, add="+")
+        if not capacite:
+            inter.unbind("<ButtonRelease-1>")
+
+        # horaire
+        carte_h = Carte(fen, t, titre="PAUSE PROGRAMMÉE")
+        carte_h.pack(fill="x", padx=px(16), pady=px((12, 0)))
+        h = c["horaires_appareils"].get(mac) or {}
+        var_h = tk.BooleanVar(value=bool(h))
+        var_d = tk.StringVar(value=h.get("debut", "22:00"))
+        var_f = tk.StringVar(value=h.get("fin", "07:00"))
+        jours = set(h.get("jours", list(range(7))))
+        l = tk.Frame(carte_h.corps, bg=t["carte"])
+        l.pack(fill="x")
+        Interrupteur(l, t, var_h).pack(side="right", anchor="n")
+        tk.Label(l, text="Pas de Wi-Fi pendant ce créneau", font=(POLICE, 12), bg=t["carte"],
+                 fg=t["texte"], anchor="w").pack(side="left")
+        lh = tk.Frame(carte_h.corps, bg=t["carte"])
+        lh.pack(fill="x", pady=px((8, 0)))
+        for texte, var in (("De", var_d), ("à", var_f)):
+            tk.Label(lh, text=texte, font=(POLICE, 12), bg=t["carte"], fg=t["texte"]).pack(
+                side="left", padx=px((0 if texte == "De" else 10, 6)))
+            tk.Entry(lh, textvariable=var, width=6, font=(POLICE, 12), justify="center", bg=t["champ"],
+                     fg=t["texte"], insertbackground=t["texte"], relief="flat", highlightthickness=1,
+                     highlightbackground=t["bordure"]).pack(side="left", ipady=px(4))
+        lj = tk.Frame(carte_h.corps, bg=t["carte"])
+        lj.pack(fill="x", pady=px((8, 0)))
+        bj = {}
+
+        def jour(i):
+            jours.symmetric_difference_update({i})
+            bj[i].configurer(style="bleu" if i in jours else "secondaire")
+        for i, lettre in enumerate(JOURS_COURTS):
+            bj[i] = BoutonPilule(lj, t, lettre, lambda i=i: jour(i), taille=11, hauteur=px(30), largeur=px(36),
+                                 style="bleu" if i in jours else "secondaire")
+            bj[i].pack(side="left", padx=px((0, 5)))
+        erreur = tk.Label(carte_h.corps, text="L'appareil est déconnecté pendant le créneau et ne peut pas "
+                                              "se reconnecter. Optima doit rester ouvert.",
+                          font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"], wraplength=px(400),
+                          justify="left", anchor="w")
+        erreur.pack(fill="x", pady=px((6, 0)))
+
+        def fermer():
+            if var_h.get():
+                d, f_ = lire_heure(var_d.get()), lire_heure(var_f.get())
+                if d is None or f_ is None or not jours:
+                    erreur.config(text="Heures au format 22:00 et au moins un jour, s'il te plaît.", fg=t["rouge"])
+                    return
+                c["horaires_appareils"][mac] = {"debut": f"{d // 60:02d}:{d % 60:02d}",
+                                                "fin": f"{f_ // 60:02d}:{f_ % 60:02d}", "jours": sorted(jours)}
+            else:
+                c["horaires_appareils"].pop(mac, None)
+            sauvegarder_config(c)
+            fen.destroy()
+            self._afficher_appareils(self.etat.get("devices", []))
+
+        bas = tk.Frame(fen, bg=t["fond"])
+        bas.pack(fill="x", padx=px(20), pady=px((14, 18)))
+        BoutonPilule(bas, t, "OK", fermer, style="principal", hauteur=px(34), largeur=px(110),
+                     fond_parent=t["fond"]).pack(side="right")
+        fen.protocol("WM_DELETE_WINDOW", fermer)
+        fen.update_idletasks()
+        taille = f"{px(480)}x{fen.winfo_reqheight()}"
+        fen.geometry(taille)
+        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
+
+    def _appliquer_priorite(self, mac, nom):
+        capacite = self._capacite_kbit()
+        if not capacite:
+            return
+
+        def action():
+            ok, sortie = executer_privilegie("priorite", mac or "aucun", str(capacite))
+            if ok:
+                self.config_actuelle["appareil_prioritaire"] = mac
+                sauvegarder_config(self.config_actuelle)
+            return ok, sortie
+
+        self._executer(action, "Réglage de la priorité…",
+                       f"{nom} passe en priorité." if mac else "Plus d'appareil prioritaire.")
+
+    def _appliquer_dns(self):
+        """Filtrage / journal : ecrit la liste puis relance la partie DNS (mot de passe demande)."""
+        c = self.config_actuelle
+        ecrire_filtre(c)
+        if not self.etat.get("running"):
+            return
+        self._executer(lambda: executer_privilegie("dns", "1" if c.get("filtre_actif") else "0",
+                                                   "1" if c.get("journal_sites") else "0"),
+                       "Mise à jour du filtrage…", "Filtrage et journal mis à jour.")
+
+    def _appliquer_cable(self):
+        c = self.config_actuelle
+        iface = self._iface_cable or interface_ethernet()
+        if not iface:
+            self._message("⚠ Aucun port Ethernet sur ce PC.", "rouge")
+            return
+        ok, texte = profil_cable(bool(c.get("filaire")), iface)
+        if not ok:
+            self._message(f"⚠ Profil câble : {texte}", "rouge")
+            return
+        self._cable.update(verifie=False, actif=False)
+        if self.etat.get("running"):
+            self._executer(lambda: executer_privilegie("filaire", iface, "on" if c.get("filaire") else "off"),
+                           "Réglage du partage par câble…",
+                           "Partage par câble prêt : branche l'appareil." if c.get("filaire")
+                           else "Partage par câble désactivé.")
+
     # -- liste blanche : demandes de connexion (26/11/2026) ---------------------------------
     def _boucle_garde(self):
         """Toutes les 1,5 s si la liste blanche est active : un appareil inconnu qui
         s'associe est aussitot refuse (deny_acl + deauth, sans root) et apparait dans
         « Demandes de connexion »."""
         try:
-            if (self.config_actuelle.get("liste_blanche") and self.etat.get("running")
-                    and not self._garde_en_cours):
+            c = self.config_actuelle
+            en_pause = {m for m, h in (c.get("horaires_appareils") or {}).items()
+                        if dans_plage({"planning_debut": h.get("debut"), "planning_fin": h.get("fin"),
+                                       "planning_jours": h.get("jours")})}
+            ajouts, retraits = en_pause - self._acl_horaire, self._acl_horaire - en_pause
+            blanche = c.get("liste_blanche")
+            if (self.etat.get("running") and not self._garde_en_cours
+                    and (blanche or en_pause or retraits)):
                 self._garde_en_cours = True
-                autorises = {m.lower() for m in self.config_actuelle.get("appareils_autorises", [])}
+                autorises = {m.lower() for m in c.get("appareils_autorises", [])}
 
                 def tache():
-                    refuses = []
+                    refuses, coupes = [], []
+                    for mac in retraits:
+                        hostapd_cmd("deny_acl", "DEL_MAC", mac)
+                    for mac in ajouts:
+                        hostapd_cmd("deny_acl", "ADD_MAC", mac)
                     for mac in lister_stations_rapide() or []:
-                        if mac in autorises:
+                        if mac in en_pause:
+                            hostapd_cmd("deauthenticate", mac)
+                            coupes.append(mac)
+                            continue
+                        if not blanche or mac in autorises:
                             continue
                         if keyid_station(mac) == "invite":
                             self._keyids[mac] = "invite"
@@ -2180,15 +3306,21 @@ class OptimaApp(tk.Tk):
                         hostapd_cmd("deny_acl", "ADD_MAC", mac)
                         hostapd_cmd("deauthenticate", mac)
                         refuses.append(mac)
-                    self._en_main(lambda: self._apres_garde(refuses))
+                    self._en_main(lambda: self._apres_garde(refuses, en_pause, ajouts, coupes))
 
                 threading.Thread(target=tache, daemon=True).start()
             self.after(1500, self._boucle_garde)
         except tk.TclError:
             pass
 
-    def _apres_garde(self, refuses):
+    def _apres_garde(self, refuses, en_pause=None, ajouts=(), coupes=()):
         self._garde_en_cours = False
+        if en_pause is not None:
+            self._acl_horaire = set(en_pause)
+        for mac in ajouts:
+            h = self.config_actuelle["horaires_appareils"].get(mac, {})
+            envoyer_notification("Optima", f"{self._nom_appareil({'mac': mac})} : pas de Wi-Fi jusqu'à "
+                                           f"{h.get('fin', '?')} (horaire de l'appareil).")
         for mac in refuses:
             nouveau = mac not in self._demandes
             self._demandes[mac] = time.time()
@@ -2474,39 +3606,6 @@ class OptimaApp(tk.Tk):
         fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
 
     # -- debit par appareil (26/11/2026) -------------------------------------------------
-    def _choisir_debit(self, mac):
-        t = self.t
-        app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {"mac": mac})
-        nom = self._nom_appareil(app)
-        actuel = int(self.config_actuelle["limites_debit"].get(mac, 0))
-        fen = tk.Toplevel(self, bg=t["fond"])
-        fen.title("Débit maximum")
-        fen.transient(self)
-        fen.resizable(False, False)
-        tk.Label(fen, text=f"Débit maximum pour « {nom} »", font=(POLICE, 14, "bold"), bg=t["fond"],
-                 fg=t["texte"], wraplength=px(400), justify="left").pack(anchor="w", padx=px(22), pady=px((20, 4)))
-        tk.Label(fen, text="S'applique tout de suite, dans les deux sens, sans déconnecter l'appareil. "
-                           "Ton mot de passe est demandé.", font=(POLICE, 11), bg=t["fond"],
-                 fg=t["texte_att"], wraplength=px(400), justify="left").pack(anchor="w", padx=px(22))
-        rangee = tk.Frame(fen, bg=t["fond"])
-        rangee.pack(fill="x", padx=px(22), pady=px((14, 22)))
-
-        def choisir(kbit):
-            fen.destroy()
-            if kbit == actuel:
-                return
-            self._appliquer_debit(mac, kbit, nom)
-
-        for kbit in DEBITS_APPAREIL:
-            lib = "Illimité" if kbit == 0 else f"{kbit // 1000} Mbit/s"
-            BoutonPilule(rangee, t, lib, lambda k=kbit: choisir(k), taille=11, hauteur=px(32),
-                         style="bleu" if kbit == actuel else "secondaire",
-                         fond_parent=t["fond"]).pack(side="left", padx=px((0, 6)))
-        fen.update_idletasks()
-        taille = f"{max(px(460), fen.winfo_reqwidth())}x{fen.winfo_reqheight()}"
-        fen.geometry(taille)
-        fen.after(100, lambda: (_premier_plan(fen), fen.geometry(taille)))
-
     def _appliquer_debit(self, mac, kbit, nom, silencieux=False):
         app = next((a for a in self.etat.get("devices", []) if a.get("mac") == mac), {})
 
@@ -2702,6 +3801,19 @@ class OptimaApp(tk.Tk):
         jours_choisis = set(cfg.get("planning_jours") or [])
         var_surveiller = tk.BooleanVar(value=cfg.get("surveiller_connexion", True))
         var_blanche = tk.BooleanVar(value=cfg.get("liste_blanche", False))
+        var_q_periode = tk.StringVar(value=cfg.get("quota_appareil_periode", "jour"))
+        var_portail = tk.BooleanVar(value=cfg.get("portail_auto", False))
+        var_p_id = tk.StringVar(value=cfg.get("portail_identifiant", ""))
+        var_p_mdp = tk.StringVar(value=cfg.get("portail_mdp", ""))
+        var_bascule = tk.BooleanVar(value=cfg.get("bascule_auto", False))
+        var_veille = tk.StringVar(value=cfg.get("anti_veille", "appareils"))
+        var_capot = tk.BooleanVar(value=cfg.get("anti_veille_capot", False))
+        var_barre = tk.BooleanVar(value=cfg.get("debit_dans_barre", True))
+        var_filtre = tk.BooleanVar(value=cfg.get("filtre_actif", False))
+        cats_choisies = set(cfg.get("filtre_categories", []))
+        var_journal = tk.BooleanVar(value=cfg.get("journal_sites", False))
+        var_cable = tk.BooleanVar(value=cfg.get("filaire", False))
+        var_rapport = tk.BooleanVar(value=cfg.get("rapport_hebdo", True))
 
         # boutons du bas fixes, le reste defile
         bas = tk.Frame(fen, bg=t["fond"])
@@ -2842,8 +3954,11 @@ class OptimaApp(tk.Tk):
                      "Tous appareils confondus. 0 = aucune limite.")
         ligne_nombre(c, "Limite par mois (Go)", var_q_mois, 0, 2000, 1,
                      "Mois civil, remis à zéro le 1er. 0 = aucune limite.")
-        ligne_nombre(c, "Limite par appareil et par jour (Mo)", var_q_app, 0, 100000, 100,
+        ligne_nombre(c, "Limite par appareil (Mo)", var_q_app, 0, 100000, 100,
                      "0 = aucune limite.")
+        ligne_choix(c, "Période de la limite par appareil", var_q_periode,
+                    (("jour", "Par jour"), ("semaine", "Par semaine"), ("mois", "Par mois")),
+                    "La semaine commence le lundi, le mois le 1er.")
         ligne_choix(c, "Quand une limite est atteinte", var_q_action,
                     (("alerter", "Me prévenir"), ("bloquer", "Couper")),
                     "Une notification arrive dès 80 %. « Couper » arrête le partage (limite du jour "
@@ -2861,6 +3976,86 @@ class OptimaApp(tk.Tk):
                                      anchor="w")
         label_erreur_plan.pack(fill="x")
 
+        def ligne_champ(corps, texte, var, secret=False):
+            tk.Label(corps, text=texte, font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"],
+                     anchor="w").pack(fill="x", pady=px((6, 3)))
+            e = tk.Entry(corps, textvariable=var, font=(POLICE, 12), bg=t["champ"], fg=t["texte"],
+                         insertbackground=t["texte"], relief="flat", highlightthickness=1,
+                         highlightbackground=t["bordure"], highlightcolor=t["bleu"], show="•" if secret else "")
+            e.pack(fill="x", ipady=px(5))
+            return e
+
+        # -- Portail captif et secours
+        c = section("PORTAIL CAPTIF ET SECOURS")
+        ligne_interrupteur(c, "Me reconnecter tout seul au portail", var_portail,
+                           "Quand le Wi-Fi source redemande sa page de connexion, Optima la remplit et "
+                           "l'envoie à ta place (case à cocher, ticket ou identifiants).")
+        ligne_champ(c, "Identifiant ou ticket (si le portail en demande)", var_p_id)
+        ligne_champ(c, "Mot de passe (si le portail en demande)", var_p_mdp, secret=True)
+        label_test_portail = tk.Label(c, text="", font=(POLICE, 10), bg=t["carte"], fg=t["texte_att"],
+                                      anchor="w", justify="left", wraplength=px(400))
+
+        def tester_portail():
+            cfg["portail_identifiant"], cfg["portail_mdp"] = var_p_id.get().strip(), var_p_mdp.get()
+            label_test_portail.config(text="Test en cours…", fg=t["texte_att"])
+
+            def resultat(ok, texte, _journal):
+                if label_test_portail.winfo_exists():
+                    label_test_portail.config(text=("✓ " if ok else "⚠ ") + texte,
+                                              fg=t["accent"] if ok else t["orange"])
+            self._reconnecter_portail(manuel=True, rappel=resultat)
+
+        BoutonPilule(c, t, "Tester maintenant", tester_portail, taille=11, hauteur=px(28)).pack(
+            anchor="w", pady=px((8, 0)))
+        label_test_portail.pack(fill="x", pady=px((4, 4)))
+        textes_aide.append(label_test_portail)
+        ligne_interrupteur(c, "Basculer sur un autre Wi-Fi connu", var_bascule,
+                           "Si Internet ne revient pas pendant 90 s (même après le portail), Optima "
+                           "connecte le PC au meilleur autre Wi-Fi enregistré et relance le partage.")
+
+        # -- Filtrage et confidentialite
+        c = section("FILTRAGE DES SITES")
+        ligne_interrupteur(c, "Bloquer des sites pour les appareils connectés", var_filtre,
+                           "Les sites choisis ne s'ouvrent plus sur ton partage (blocage par DNS). "
+                           "Économise aussi des données, surtout la vidéo.")
+        rangee_cat = tk.Frame(c, bg=t["carte"])
+        rangee_cat.pack(fill="x", pady=px((2, 4)))
+        boutons_cat = {}
+
+        def basculer_cat(k):
+            cats_choisies.symmetric_difference_update({k})
+            boutons_cat[k].configurer(style="bleu" if k in cats_choisies else "secondaire")
+
+        for i, (k, (lib, _d)) in enumerate(CATEGORIES_FILTRE.items()):
+            b = BoutonPilule(rangee_cat, t, lib, lambda k=k: basculer_cat(k), taille=11, hauteur=px(28),
+                             style="bleu" if k in cats_choisies else "secondaire")
+            b.grid(row=i // 2, column=i % 2, sticky="w", padx=px((0, 6)), pady=px(3))
+            boutons_cat[k] = b
+        tk.Label(c, text="Autres sites (un par ligne)", font=(POLICE, 11), bg=t["carte"],
+                 fg=t["texte_att"], anchor="w").pack(fill="x", pady=px((6, 3)))
+        zone_perso = tk.Text(c, height=3, font=(POLICE, 11), bg=t["champ"], fg=t["texte"],
+                             insertbackground=t["texte"], relief="flat", highlightthickness=1,
+                             highlightbackground=t["bordure"], wrap="none")
+        zone_perso.insert("1.0", cfg.get("filtre_perso", ""))
+        zone_perso.pack(fill="x")
+        ligne_interrupteur(c, "Journal des sites visités", var_journal,
+                           "Optima note les sites demandés par chaque appareil (Statistiques). "
+                           "Reste sur ce PC, effacé après 30 jours. Préviens les personnes qui se connectent.")
+
+        # -- Cable
+        c = section("PARTAGE PAR CÂBLE")
+        ligne_interrupteur(c, "Partager aussi par câble Ethernet", var_cable,
+                           "Branche un PC ou une console sur le port Ethernet : il reçoit Internet. "
+                           "Si le câble mène à une box, Optima le voit et ne partage pas dessus.")
+
+        # -- Veille
+        c = section("MISE EN VEILLE")
+        ligne_choix(c, "Empêcher la mise en veille", var_veille,
+                    (("jamais", "Jamais"), ("appareils", "Si des appareils sont connectés"),
+                     ("toujours", "Pendant tout le partage")))
+        ligne_interrupteur(c, "Même capot fermé", var_capot,
+                           "Le PC continue de partager quand tu fermes l'écran (pense au chargeur).")
+
         # -- Arret
         c = section("ARRÊT ET ÉCONOMIE")
         ligne_choix(c, "Arrêter si plus aucun appareil depuis", var_inactif,
@@ -2876,6 +4071,10 @@ class OptimaApp(tk.Tk):
         ligne_interrupteur(c, "Surveiller la connexion source", var_surveiller,
                            "Mesure le ping toutes les 5 s et te prévient si le Wi-Fi source "
                            "coupe Internet ou redemande la page de connexion (portail captif).")
+        ligne_interrupteur(c, "Débit dans la barre du haut", var_barre,
+                           "Affiche à côté du point vert le débit actuel et le nombre d'appareils.")
+        ligne_interrupteur(c, "Rapport PDF chaque lundi", var_rapport,
+                           "Résumé de la semaine dans Documents/Optima, avec une notification.")
         ligne_choix(c, "Apparence", var_theme, (("auto", "Auto"), ("clair", "Clair"), ("sombre", "Sombre")))
 
         texte_bas = "Les réglages Réseau s'appliquent au prochain démarrage du partage."
@@ -2909,6 +4108,25 @@ class OptimaApp(tk.Tk):
             cfg["planning_actif"] = var_plan.get()
             cfg["quota_action"] = var_q_action.get()
             cfg["surveiller_connexion"] = var_surveiller.get()
+            cfg["quota_appareil_periode"] = var_q_periode.get()
+            cfg["portail_auto"] = var_portail.get()
+            cfg["portail_identifiant"] = var_p_id.get().strip()
+            cfg["portail_mdp"] = var_p_mdp.get()
+            cfg["bascule_auto"] = var_bascule.get()
+            cfg["anti_veille"] = var_veille.get()
+            cfg["anti_veille_capot"] = var_capot.get()
+            cfg["debit_dans_barre"] = var_barre.get()
+            cfg["rapport_hebdo"] = var_rapport.get()
+            avant_dns = (cfg.get("filtre_actif"), sorted(cfg.get("filtre_categories", [])),
+                         cfg.get("filtre_perso", ""), cfg.get("journal_sites"))
+            cfg["filtre_actif"] = var_filtre.get()
+            cfg["filtre_categories"] = sorted(cats_choisies)
+            cfg["filtre_perso"] = zone_perso.get("1.0", "end").strip()
+            cfg["journal_sites"] = var_journal.get()
+            dns_change = avant_dns != (cfg["filtre_actif"], cfg["filtre_categories"],
+                                       cfg["filtre_perso"], cfg["journal_sites"])
+            cable_change = bool(cfg.get("filaire")) != var_cable.get()
+            cfg["filaire"] = var_cable.get()
             if var_blanche.get() and not cfg.get("liste_blanche"):
                 self._activer_liste_blanche()
             cfg["liste_blanche"] = var_blanche.get()
@@ -2947,6 +4165,11 @@ class OptimaApp(tk.Tk):
             (activer_autostart if var_auto.get() else desactiver_autostart)()
             fen.destroy()
             self._message("✓ Réglages enregistrés.", "accent")
+            self._label_barre = None
+            if cable_change:
+                self._appliquer_cable()
+            if dns_change:
+                self.after(300, self._appliquer_dns)
             if cfg["theme"] != ancien_theme:
                 self._reconstruire()
 
@@ -2957,7 +4180,7 @@ class OptimaApp(tk.Tk):
                 return
             ancien_theme = cfg.get("theme", "auto")
             for cle, valeur in CONFIG_PAR_DEFAUT.items():
-                if cle not in ("ssid", "password", "surnoms", "auto_start"):
+                if cle not in CLES_PERSONNELLES:
                     cfg[cle] = json.loads(json.dumps(valeur))
             sauvegarder_config(cfg)
             fen.destroy()
@@ -3041,6 +4264,19 @@ class OptimaApp(tk.Tk):
                  fg=t["texte"]).pack(side="left")
         BoutonPilule(tete, t, "Exporter (CSV)", lambda: exporter(), taille=11, hauteur=px(28),
                      fond_parent=t["fond"]).pack(side="right")
+        bouton_rapport = BoutonPilule(tete, t, "Rapport PDF", lambda: rapport(), taille=11, hauteur=px(28),
+                                      fond_parent=t["fond"], style="bleu")
+        bouton_rapport.pack(side="right", padx=px((0, 8)))
+
+        def rapport():
+            bouton_rapport.configurer(texte="Création…", actif=False)
+
+            def fini(ok, texte):
+                if bouton_rapport.winfo_exists():
+                    bouton_rapport.configurer(texte="Rapport PDF", actif=True)
+                    info.config(text=("✓ Rapport : " if ok else "⚠ Rapport impossible : ") + texte,
+                                fg=t["accent"] if ok else t["rouge"])
+            self._faire_rapport(ouvrir=True, rappel=fini)
 
         # resume
         carte = Carte(contenu, t)
@@ -3145,8 +4381,128 @@ class OptimaApp(tk.Tk):
         cadre_cl.pack(fill="x")
 
         def nom_mac(mac):
+            if mac == "cable":
+                return "Câble Ethernet"
             return (self.config_actuelle["surnoms"].get(mac) or cp.donnees["noms"].get(mac)
                     or self._nom_historique(mac) or mac)
+
+        # qualite de la connexion source
+        carte_q = Carte(contenu, t, titre="QUALITÉ DE LA CONNEXION SOURCE")
+        carte_q.pack(fill="x", padx=px(16), pady=px((0, 12)))
+        choix_q = tk.Frame(carte_q.corps, bg=t["carte"])
+        choix_q.pack(fill="x", pady=px((0, 8)))
+        info_q = tk.Label(carte_q.corps, text="", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"],
+                          anchor="w", justify="left", wraplength=px(440))
+        info_q.pack(fill="x")
+        graphe_q = tk.Canvas(carte_q.corps, height=px(120), bg=t["carte"], highlightthickness=0, bd=0)
+        graphe_q.pack(fill="x", pady=px((6, 0)))
+        periode_q = {"h": 24}
+        boutons_q = {}
+        hist = self.qualite_hist
+
+        def dessiner_q(_e=None):
+            graphe_q.delete("all")
+            w, h = graphe_q.winfo_width(), graphe_q.winfo_height()
+            if w < 20:
+                return
+            pas = 10 if periode_q["h"] <= 24 else 60
+            cases = hist.periode(periode_q["h"], pas)
+            bas_axe, haut_axe = h - px(18), px(6)
+            maxi = max([c_[1] for c_ in cases if c_[1] is not None] + [50])
+            n = len(cases)
+            larg = w / max(1, n)
+            graphe_q.create_line(0, bas_axe, w, bas_axe, fill=t["bordure"])
+            points = []
+            for i, (debut_m, ping, coupees, mesurees) in enumerate(cases):
+                x = i * larg
+                if coupees:
+                    graphe_q.create_rectangle(x, haut_axe, x + larg, bas_axe, fill=t["rouge"], outline="",
+                                              stipple="gray50" if coupees < pas / 2 else "")
+                if ping is not None:
+                    points += [x + larg / 2, bas_axe - (ping / maxi) * (bas_axe - haut_axe)]
+                elif len(points) >= 4:
+                    graphe_q.create_line(points, fill=t["bleu"], width=px(2))
+                    points = []
+                else:
+                    points = []
+                moment = datetime.fromtimestamp(debut_m * 60)
+                if (periode_q["h"] <= 24 and moment.minute == 0 and moment.hour % 6 == 0) or \
+                        (periode_q["h"] > 24 and moment.hour == 0):
+                    lib = f"{moment:%H}h" if periode_q["h"] <= 24 else JOURS_SEMAINE[moment.weekday()]
+                    graphe_q.create_text(min(max(x, px(14)), w - px(14)), h - px(1), text=lib, anchor="s",
+                                         font=(POLICE, 9), fill=t["texte_att"])
+            if len(points) >= 4:
+                graphe_q.create_line(points, fill=t["bleu"], width=px(2))
+            graphe_q.create_text(0, 0, text=f"max {maxi:.0f} ms", anchor="nw", font=(POLICE, 9),
+                                 fill=t["texte_att"])
+            r = hist.resume(periode_q["h"])
+            if not r["mesures"]:
+                info_q.config(text="Pas encore de mesures sur cette période (la surveillance doit être active).")
+                return
+            morceaux = [f"Ping moyen {r['ping']:.0f} ms" if r["ping"] else "Ping —",
+                        f"{r['coupures']} coupure{'s' if r['coupures'] > 1 else ''}"
+                        + (f" ({r['minutes_coupees']} min)" if r["coupures"] else "")]
+            if r["meilleure_heure"] is not None:
+                morceaux.append(f"meilleur moment : {r['meilleure_heure']}\u00a0h–{r['meilleure_heure'] + 1}\u00a0h")
+            info_q.config(text="   ·   ".join(morceaux))
+
+        def choisir_q(hh):
+            periode_q["h"] = hh
+            for k, b in boutons_q.items():
+                b.configurer(style="bleu" if k == hh else "secondaire")
+            dessiner_q()
+
+        for hh, lib in ((24, "24 heures"), (168, "7 jours")):
+            b = BoutonPilule(choix_q, t, lib, lambda hh=hh: choisir_q(hh), taille=11, hauteur=px(28))
+            b.pack(side="left", padx=px((0, 6)))
+            boutons_q[hh] = b
+        graphe_q.bind("<Configure>", dessiner_q)
+        choisir_q(24)
+
+        # sites les plus consultes
+        if self.config_actuelle.get("journal_sites"):
+            carte_s = Carte(contenu, t, titre="SITES LES PLUS CONSULTÉS")
+            carte_s.pack(fill="x", padx=px(16), pady=px((0, 16)))
+            choix_s = tk.Frame(carte_s.corps, bg=t["carte"])
+            choix_s.pack(fill="x", pady=px((0, 6)))
+            cadre_s = tk.Frame(carte_s.corps, bg=t["carte"])
+            cadre_s.pack(fill="x")
+            filtre_s = {"mac": None}
+            boutons_s = {}
+
+            def remplir_sites():
+                for e in cadre_s.winfo_children():
+                    e.destroy()
+                top = self.journal_sites.classement(periode["n"], filtre_s["mac"])[:10]
+                if not top:
+                    tk.Label(cadre_s, text="Rien pour l'instant sur cette période.", font=(POLICE, 12),
+                             bg=t["carte"], fg=t["texte_att"], anchor="w").pack(fill="x")
+                    return
+                maxi = top[0][1]
+                for d, n in top:
+                    l = tk.Frame(cadre_s, bg=t["carte"])
+                    l.pack(fill="x", pady=px(2))
+                    tk.Label(l, text=d, font=(POLICE, 12), bg=t["carte"], fg=t["texte"]).pack(side="left")
+                    tk.Label(l, text=f"{n}", font=(POLICE, 11), bg=t["carte"], fg=t["texte_att"]).pack(side="right")
+                    j = Jauge(cadre_s, t)
+                    j.pack(fill="x")
+                    j.definir(n / maxi * 0.79)
+
+            def choisir_s(mac):
+                filtre_s["mac"] = mac
+                for k, b in boutons_s.items():
+                    b.configurer(style="bleu" if k == mac else "secondaire")
+                remplir_sites()
+
+            for mac in [None] + self.journal_sites.appareils(90)[:3]:
+                lib = "Tous" if mac is None else nom_mac(mac)[:18]
+                b = BoutonPilule(choix_s, t, lib, lambda m=mac: choisir_s(m), taille=11, hauteur=px(28))
+                b.pack(side="left", padx=px((0, 6)))
+                boutons_s[mac] = b
+            self._remplir_sites = remplir_sites
+            choisir_s(None)
+        else:
+            self._remplir_sites = None
 
         def remplir_classement():
             for e in cadre_cl.winfo_children():
@@ -3178,6 +4534,8 @@ class OptimaApp(tk.Tk):
             info.config(text=texte_info_defaut(), fg=t["texte_att"])
             dessiner_graphe()
             remplir_classement()
+            if getattr(self, "_remplir_sites", None):
+                self._remplir_sites()
 
         for n, lib in ((7, "7 jours"), (30, "30 jours"), (90, "90 jours")):
             b = BoutonPilule(choix, t, lib, lambda n=n: choisir(n), taille=11, hauteur=px(28))
@@ -3307,6 +4665,9 @@ class OptimaApp(tk.Tk):
 
     def _quitter(self):
         self.compteur.sauvegarder(forcer=True)
+        self.qualite_hist._clore()
+        self.qualite_hist.sauvegarder(forcer=True)
+        self.anti_veille.arreter()
         if self.icone_tray:
             try:
                 self.icone_tray.stop()

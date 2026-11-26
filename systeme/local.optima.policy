@@ -52,4 +52,25 @@
     <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/limit</annotate>
   </action>
+  <action id="local.optima.priorite">
+    <description>Optima : priorite</description>
+    <message>Optima a besoin de ton mot de passe pour donner la priorité à un appareil connecté.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/priorite</annotate>
+  </action>
+  <action id="local.optima.dns">
+    <description>Optima : dns</description>
+    <message>Optima a besoin de ton mot de passe pour mettre à jour le blocage de sites et le journal des sites.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/dns</annotate>
+  </action>
+  <action id="local.optima.filaire">
+    <description>Optima : filaire</description>
+    <message>Optima a besoin de ton mot de passe pour partager la connexion par câble Ethernet.</message>
+    <icon_name>network-wireless-hotspot</icon_name>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/optima/filaire</annotate>
+  </action>
 </policyconfig>
